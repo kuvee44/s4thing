@@ -472,8 +472,48 @@ Process injection techniques (reflective DLL injection, module stomping, Early B
 
 **Blog:** https://blog.harmj0y.net/
 **GhostPack:** https://github.com/GhostPack
+**Focus:** Active Directory attack research, Kerberos protocol abuse, GhostPack tooling, ADCS
 
-Active Directory attack research. Kerberos attack paths (Kerberoasting, ASREPRoasting, unconstrained delegation abuse, constrained delegation S4U2Proxy), BloodHound graph-based attack path analysis, GhostPack tooling (Rubeus, Seatbelt, SharpUp). Relevant as the primary source for understanding how Windows domain authentication works from an attacker's perspective — complements the local authentication/relay work from decoder's blog.
+Will Schroeder's research arc is the most important single body of work on Active Directory offensive security. His output spans both the conceptual layer (how Kerberos actually works, what the protocol permits) and the tool layer (Rubeus, the reference implementation of everything Kerberos-related from an attacker's perspective).
+
+**Key research threads:**
+
+**Kerberoasting (2014–ongoing)**
+URL: https://blog.harmj0y.net/powershell/kerberoasting-without-mimikatz/
+
+Any authenticated domain user can request a Kerberos TGS (Ticket-Granting Service) ticket for any service account that has a `servicePrincipalName` (SPN) set. The TGS is encrypted with the service account's NTLM hash (RC4 by default, AES-256 if configured). The attacker takes the TGS offline and cracks it. If the service account has a weak password, the hash cracks to plaintext — giving credentials for the service account (which is often highly privileged). Will Schroeder popularized this attack and built the initial tooling. The key insight: no special privilege is required; any domain user can perform this request, because SPNs are publicly queryable from LDAP.
+
+Variant: **AS-REP Roasting** — accounts with Kerberos pre-authentication disabled can be AS-REP roasted (request AS-REP for the account, extract the encrypted part, crack offline). Configured via the `DONT_REQUIRE_PREAUTH` account flag.
+
+**Unconstrained Delegation Abuse**
+Any machine account or service account with Unconstrained Delegation enabled (`TrustedForDelegation` flag in AD) stores the full TGT of any user who authenticates to it. If an attacker compromises a server with Unconstrained Delegation, they can extract TGTs from its memory using Mimikatz/Rubeus and use them to authenticate anywhere the TGT holder has access. Combined with PrinterBug coercion (MS-RPRN forcing a Domain Controller to authenticate to the compromised server), this becomes a path to Domain Admin.
+- URL: https://blog.harmj0y.net/redteaming/not-a-security-boundary-breaking-forest-trusts/
+
+**Constrained Delegation and S4U2Proxy**
+URL: https://blog.harmj0y.net/activedirectory/s4u2pwnage/
+
+Constrained Delegation allows a service to impersonate any user when contacting *specific* target services. The S4U2Self extension lets the service obtain a ticket to itself on behalf of any user (even without that user's TGT). S4U2Proxy then extends this to the configured target services. Attack path: compromise a service account with Constrained Delegation configured → use Rubeus S4U to get a ticket impersonating a domain admin → access the target service as domain admin.
+
+Resource-Based Constrained Delegation (RBCD) — introduced in Windows Server 2012 — is more dangerous from an attacker's perspective: instead of requiring domain admin to configure delegation, the *target machine* controls who can delegate to it via `msDS-AllowedToActOnBehalfOfOtherIdentity`. Any principal with `GenericWrite` on a computer object can set RBCD to a machine they control, then impersonate any user to that computer. RBCD is the underpinning of KrbRelayUp (local privilege escalation) and "Wagging the Dog" (Elad Shamir's RBCD research).
+
+**"Certified Pre-Owned" — ADCS attack classes (2021)**
+URL: https://posts.specterops.io/certified-pre-owned-d95910965cd2 (whitepaper)
+Co-authored with Andy Robbins.
+
+The definitive reference on Active Directory Certificate Services (ADCS) offensive security. Catalogs ESC1–ESC8 (later extended to ESC13+) attack classes:
+- **ESC1:** Certificate template allows `SubjectAltName` specified by requester AND Client Authentication EKU — any user can request a certificate for any other user (including Domain Admin) and authenticate as them
+- **ESC3:** Certificate template for Certificate Request Agent + no enrollment restrictions — abuse to request certificates on behalf of any user
+- **ESC4:** Writable certificate template ACL — user can modify template to enable ESC1
+- **ESC6:** `EDITF_ATTRIBUTESUBJECTALTNAME2` flag on CA — enables SAN on all templates
+- **ESC8:** NTLM relay to ADCS HTTP enrollment endpoint — relay a machine account's NTLM auth to ADCS, obtain a machine certificate, then use PKINIT to get a TGT
+- **ESC9/ESC10:** Shadow credentials path via `GenericWrite` + ADCS
+
+This paper fundamentally expanded the AD attack surface map; every AD pentest since 2021 runs ADCS enumeration as a standard step.
+
+**Rubeus**
+URL: https://github.com/GhostPack/Rubeus
+
+C# implementation of Kerberos protocol operations directly against the Windows KDC (not using the Windows SSPI layer). Direct KDC communication gives more control and visibility than SSPI-based tools. Operations: AS-REQ/AS-REP (roasting, overpass-the-hash), TGS-REQ (Kerberoasting), S4U2Self, S4U2Proxy, PKINIT (certificate-based TGT), Pass-the-Ticket, Renew ticket, monitor for new logons. Source is the reference implementation for understanding what Kerberos requests actually look like on the wire.
 
 ### Benjamin Delpy (gentilkiwi)
 
@@ -482,21 +522,177 @@ Active Directory attack research. Kerberos attack paths (Kerberoasting, ASREPRoa
 
 Author of Mimikatz. His blog covers the internals of Windows credential storage — LSASS memory structure, how WDigest/NTLM/Kerberos credentials are cached in memory, SSP (Security Support Provider) loading, the credential guard architecture. Reading his work explains *why* Mimikatz works the way it does — what structures it reads, why those structures are in LSASS's memory, and what protections (Credential Guard, PPL on LSASS) prevent credential access.
 
+Key research:
+- **WDigest credential caching:** WDigest stores plaintext credentials in LSASS memory (enabled by `UseLogonCredential = 1` in registry, or on older Windows by default). Delpy mapped the exact LSASS memory structures where WDigest stores them — `wdigest!l_LogSessList` linked list of `WDIGEST_CREDENTIALS` nodes with plaintext password field.
+- **Kerberos ticket extraction:** `sekurlsa::tickets` dumps Kerberos tickets from LSASS memory. The tickets are extracted from `kerberos!KerbLogonSessionTable` structures. Understanding this is prerequisite to understanding Rubeus's `dump` command.
+- **DPAPI master key extraction:** DPAPI (Data Protection API) uses user-specific master keys stored in `%APPDATA%\Microsoft\Protect\`. The master key is derived from the user's password. Delpy documented how to extract master keys from LSASS (`dpapi::masterkey /rpc`) — this unlocks all DPAPI-protected secrets (browser passwords, certificates, RDP credentials).
+- **Credential Guard architecture:** Windows Credential Guard moves LSA credential storage into VTL1 (Isolated LSA). Delpy documented what this protects (NTLM hashes, Kerberos TGTs) and what it does not protect (DPAPI blobs remain in VTL0, Kerberos service tickets remain in VTL0, TGTs accessible to processes with SeDebugPrivilege via Isolated LSA RPC interface in some configs).
+
+---
+
 ### Synacktiv
 
 **URL:** https://www.synacktiv.com/publications.html
+**Focus:** COM/DCOM attack surface, Windows driver vulnerabilities, Hyper-V guest-to-host, EDR bypass
 
-French offensive security firm with a strong publication record. Windows-relevant research: COM/DCOM attack surface, Windows driver vulnerabilities, hypervisor research (Hyper-V guest-to-host), mobile/automotive security. Quality is consistently high; each publication includes root cause and exploitation detail.
+French offensive security firm with a consistently high-quality publication record. Their Windows research is notable for targeting less-explored surfaces: hypervisor attack surface, Windows driver security, and COM security that goes beyond the standard examples.
+
+**Notable research:**
+
+**Hyper-V guest-to-host research**
+URL: https://www.synacktiv.com/publications/escaping-from-hyper-v-in-vmwp-exe (representative; search synacktiv.com for "Hyper-V")
+
+Synacktiv has published multiple Hyper-V guest-to-host escape vulnerabilities — targeting `vmwp.exe` (Virtual Machine Worker Process, the host-side component that handles VM device emulation). `vmwp.exe` runs at medium IL on the host but handles untrusted input from the VM guest. Vulnerabilities here allow a VM guest to execute code in `vmwp.exe` on the host, then escalate from `vmwp.exe` to SYSTEM on the host via standard LPE. The research demonstrates why Hyper-V isolation boundaries are harder to maintain than simple process isolation.
+
+**COM/DCOM security research**
+Synacktiv has produced detailed analyses of COM server implementations that expose dangerous methods to low-privilege clients — focusing specifically on DCOM servers registered in HKLM with launch/activation permissions that allow guest/everyone access. Their methodology: enumerate all DCOM servers, filter for those with permissive launch permissions (using NtObjectManager), then enumerate their exposed interfaces for dangerous method patterns (file write, process creation, service manipulation).
+
+**EDR bypass research**
+Research on Windows EDR (Endpoint Detection & Response) architecture — specifically targeting ELAM (Early Launch Anti-Malware) drivers, ETW (Event Tracing for Windows) consumer manipulation, and callback-based detection suppression. Context for understanding both the defensive infrastructure and how attackers circumvent it.
+
+---
 
 ### SpecterOps
 
 **URL:** https://posts.specterops.io/
+**Focus:** Active Directory attack/defense, BloodHound, ADCS, GhostPack
 
-BloodHound development and Active Directory attack research. Primary contributions: documenting attack paths in AD that BloodHound now models (ACL-based paths like `WriteOwner`, `GenericWrite`, `WriteDacl` on AD objects), ADCS (Active Directory Certificate Services) abuse (ESC1–ESC8 attack classes, documented in the "Certified Pre-Owned" paper), GhostPack tooling.
+BloodHound development and Active Directory attack research. SpecterOps is one of the few organizations where offensive capability (finding new AD attack paths) directly drives defensive tooling (BloodHound models those paths). Their research arc:
+
+**BloodHound / SharpHound**
+URL: https://github.com/BloodHoundAD/BloodHound
+
+BloodHound represents a methodological shift in AD attack path analysis. Before BloodHound, AD attacks were enumerated manually or with point tools. BloodHound collects AD data (users, groups, GPOs, ACLs, local admin sessions, trust relationships) via SharpHound, ingests it into Neo4j, then uses graph theory to find attack paths that are not obvious from any single data point. Key insight: `Domain Admin` reachability is a graph problem — the question is not "can I attack this server directly" but "is there any path from my current position to Domain Admin through any combination of ACL edges, session edges, and group membership edges."
+
+Current BloodHound Community Edition (CE) vs Enterprise — CE is the free open-source version; Enterprise is the commercial version with attack path prioritization. For research purposes, CE is sufficient.
+
+**ADCS "Certified Pre-Owned" paper (2021)**
+URL: https://posts.specterops.io/certified-pre-owned-d95910965cd2
+
+Co-authored by Will Schroeder and Andy Robbins. See Will Schroeder section above for detailed ESC breakdown. The significance from SpecterOps's perspective: this paper opened an entirely new attack surface in environments that were otherwise well-hardened against traditional AD attacks. Environments that had addressed Kerberoasting, delegation abuse, and lateral movement via sessions still had exploitable ADCS configurations in the majority of cases.
+
+**Elastic Security Labs**
+
+**URL:** https://www.elastic.co/security-labs/
+**Focus:** PPL bypass, LSASS access techniques, kernel telemetry, EDR detection research
+
+Elastic's security research lab publishes at the intersection of offensive technique discovery and defensive detection. Their Windows research focuses on techniques that bypass or evade EDR products — which means they document the techniques in enough detail to build detection logic, and that same detail is useful for understanding the techniques offensively.
+
+**Key areas:**
+- **PPL bypass:** Multiple publications on Protected Process Light bypass techniques for LSASS access. The techniques exploit signed but vulnerable kernel drivers (BYOVD — Bring Your Own Vulnerable Driver) to load unsigned code at kernel level and remove PPL protection. Specific coverage: abusing `iqvw64e.sys` (Intel driver), `gdrv.sys`, other vulnerable signed drivers for PPL bypass via kernel memory manipulation.
+  URL: https://www.elastic.co/security-labs/protecting-lsass-anti-cheat-driver (and related posts)
+- **Direct system call (syscall) evasion:** Techniques where user-mode code bypasses NTDLL hooks (placed by EDR products) by invoking syscalls directly — using `syswhispers` patterns or dynamically extracting syscall numbers from NTDLL. Elastic documented both the technique and how to detect it via ETW kernel events.
+- **ETW (Event Tracing for Windows) as telemetry:** Posts on what ETW providers capture about process injection, handle duplication, token manipulation — showing exactly which ETW events are the signals that EDR products use for detection. Useful for understanding what defensive visibility exists against each technique.
+- **LSASS access patterns:** Enumeration of every technique for accessing LSASS memory (MiniDumpWriteDump, direct memory read via `ReadProcessMemory`, `PssCaptureSnapshot`, shadow copy access, Comsvcs.dll, custom LSA plugins) with corresponding ETW/kernel callback signals.
 
 ---
 
-## Tier 3 — Historical / Archived (Methodology Still Relevant)
+## Tier 2.5 — Active Directory & Domain Research
+
+### Elad Shamir
+
+**Blog:** https://shenaniganslabs.io/
+**Twitter/X:** @elad_shamir
+**Focus:** Kerberos delegation, RBCD, Shadow Credentials, Active Directory ACL abuse
+
+Elad Shamir is the primary researcher responsible for articulating Resource-Based Constrained Delegation (RBCD) as a general-purpose privilege escalation primitive. His "Wagging the Dog" paper is one of the most consequential offensive AD research contributions of the 2018–2022 period.
+
+**"Wagging the Dog: Abusing Resource-Based Constrained Delegation to Attack Active Directory" (2019)**
+URL: https://shenaniganslabs.io/2019/01/28/Wagging-the-Dog.html
+
+The key observation: RBCD (`msDS-AllowedToActOnBehalfOfOtherIdentity`) is configured on the *target* machine, not by a domain admin. Any principal with `GenericWrite`, `WriteDacl`, `WriteProperty` (on the specific attribute), or `GenericAll` on a computer object can set RBCD on that computer. This means:
+
+1. Attacker has `GenericWrite` on `TARGETPC$` (found via BloodHound ACL enumeration)
+2. Attacker creates or controls a machine account `ATTACKERPC$` (or any account with an SPN)
+3. Attacker sets `msDS-AllowedToActOnBehalfOfOtherIdentity` on `TARGETPC$` to allow delegation from `ATTACKERPC$`
+4. Attacker uses S4U2Self + S4U2Proxy via Rubeus to request a ticket to any service on `TARGETPC$` impersonating any user (e.g., Administrator)
+5. Attacker now has a service ticket to `TARGETPC$` as Administrator → pass-the-ticket → full access to `TARGETPC$`
+
+The paper also documents: using RBCD for local privilege escalation (when you have write access to your own machine account from a local context — this is the basis for KrbRelayUp), and RBCD abuse via NTLM relay (relay a machine account's NTLM to LDAP, set RBCD on that machine, then use S4U).
+
+**Shadow Credentials (2021)**
+URL: https://posts.specterops.io/shadow-credentials-abusing-key-trust-account-mapping-for-takeover-8ee1a53566ab
+
+Shamir discovered that `msDS-KeyCredentialLink` attribute (used by Windows Hello for Business and similar PKINIT-based passwordless authentication) can be manipulated by any principal with `GenericWrite` on the target account. The attack: write an attacker-controlled public key to `msDS-KeyCredentialLink` on the target user/computer, then use PKINIT with the corresponding private key to authenticate as that account — obtaining a TGT and NTLM hash without ever knowing the account's password. The `msDS-KeyCredentialLink` write is silent (no password change), making this a stealthy path to account compromise.
+
+Tool: **Whisker** (https://github.com/eladshamir/Whisker) — C# implementation of shadow credentials attack.
+
+---
+
+### Andy Robbins
+
+**Blog:** https://posts.specterops.io/ (SpecterOps blog)
+**Twitter/X:** @_wald0
+**Focus:** BloodHound methodology, Active Directory attack path enumeration, ADCS
+
+Andy Robbins is BloodHound's primary architect from a methodology standpoint. His contributions are less about finding new bugs and more about formalizing the *methodology* for AD attack path analysis — turning what was informal tribal knowledge ("check group memberships, check sessions, check ACLs") into a formal graph problem.
+
+**"An ACE Up the Sleeve: Designing Active Directory DACL Backdoors" (2017)**
+URL: https://www.blackhat.com/docs/us-17/wednesday/us-17-Robbins-An-ACE-Up-The-Sleeve-Designing-Active-Directory-DACL-Backdoors-wp.pdf
+
+Co-authored with Will Schroeder. The paper that established ACL-based AD backdoors and attack paths as a first-class attack surface. Before this paper, most AD attacks focused on credentials and tickets. This paper documented: which ACL rights on which AD object types enable which attacks, the complete mapping of `GenericAll/GenericWrite/WriteDacl/WriteOwner/AllExtendedRights` on users, groups, computers, GPOs, domain objects to their attacker implications.
+
+This is why BloodHound models ACL edges — the paper provided the taxonomy. Every `GenericWrite → Computer → RBCD` path in BloodHound traces back to this foundational work.
+
+**"Certified Pre-Owned" (2021)**
+URL: https://posts.specterops.io/certified-pre-owned-d95910965cd2
+
+Co-authored with Will Schroeder. See Will Schroeder section above.
+
+---
+
+### Charlie Clark (exploitph)
+
+**Blog:** https://exploit.ph/
+**Focus:** Kerberos protocol internals, PAC manipulation, advanced Kerberos attacks
+
+Charlie Clark's work sits at a deeper protocol layer than most AD research — he analyzes the Kerberos protocol specification itself and finds discrepancies between what the specification says, what Windows implements, and what Windows accepts from clients.
+
+**Diamond Tickets (2022)**
+URL: https://exploit.ph/diamond-tickets.html
+
+A **golden ticket** forges a TGT by encrypting it with the KRBTGT hash. Detection: the PAC contains data that doesn't match what the KDC would have generated (missing or mismatched fields). A **diamond ticket** modifies an *existing legitimate TGT* (obtained from the KDC) rather than forging one from scratch. The modifications (privilege extensions, group additions) are applied to the PAC *after* the KDC signs it, by using the KRBTGT key to re-sign. Because the base ticket is legitimate, many of the anomaly checks that detect golden tickets fail. The diamond ticket technique requires the KRBTGT hash but produces a ticket that blends with legitimate traffic better.
+
+**Sapphire Tickets (2022)**
+URL: https://exploit.ph/sapphire-tickets.html
+
+Extension of diamond ticket concept. Instead of forging the KRBTGT-encrypted portion, sapphire tickets use S4U2Self + U2U (User-to-User authentication) to obtain a valid PAC for any user from the KDC itself, then inject that legitimate PAC into a forged ticket. The PAC is genuinely KDC-issued, making detection harder still.
+
+**PAC manipulation research**
+The Kerberos PAC (Privilege Attribute Certificate) contains the user's group memberships and security identifier information, used for access checks on Windows. Clark's research examines the validation of PAC contents — specifically, when DCs validate PAC signatures vs. when they trust the contents uncritically. This maps directly to Kerberos privilege escalation via PAC modification.
+
+**S4U delegation chain analysis**
+Clark has published detailed analysis of S4U2Self and S4U2Proxy protocol mechanics — specifically examining edge cases where the delegation constraint checks can be bypassed or the impersonation chain can be extended beyond intended scope. His blog is the most technically precise source for understanding what the KDC actually validates vs. what it trusts.
+
+---
+
+### hasherezade
+
+**Blog:** https://hshrzd.wordpress.com/ and https://github.com/hasherezade
+**Twitter/X:** @hasherezade
+**Focus:** PE file analysis, process injection techniques, malware internals, Windows loader internals
+
+hasherezade's work is adjacent to security research but essential for understanding the lower layers of Windows execution — specifically how PE files are loaded, how process injection techniques work at the API and memory level, and how malware leverages Windows internals.
+
+**PE-sieve and process memory analysis**
+URL: https://github.com/hasherezade/pe-sieve
+
+PE-sieve scans a running process's memory and compares loaded modules against their on-disk counterparts. Detects: hooks in NTDLL/kernel32 (placed by EDR products or malware), hollowed processes (where the original PE is replaced in memory), module stomping (where a loaded DLL's memory is overwritten), shellcode injection (memory regions with execute permission that don't correspond to loaded modules), reflective DLL injection (DLL loaded without going through the normal loader).
+
+**Why this matters for security research:** Understanding what PE-sieve detects reveals what process injection leaves as forensic artifacts. The tool's detection logic is effectively a catalog of injection technique signatures.
+
+**Process injection technique catalog**
+URL: https://github.com/hasherezade/process_overwriting, https://github.com/hasherezade/process_doppelganging
+
+hasherezade has implemented reference PoCs for multiple injection techniques:
+- **Process hollowing:** Create process in suspended state, unmap original PE, map malicious PE
+- **Process doppelgänging:** Use NTFS transactions to load a PE from a transacted file that is rolled back after loading — the loaded image doesn't correspond to any file on disk
+- **Process overwriting:** Overwrite the image of a suspended process's main module in memory with a different PE — more stealthy than hollowing because the process is not suspended for long and the PEB isn't modified in the same ways
+
+**Windows loader internals**
+Her blog posts on how the Windows PE loader maps sections, resolves imports, handles TLS callbacks, and interacts with the PEB (Process Environment Block) are the best practical references for understanding what injection techniques do at the loader level — what they change in `_PEB_LDR_DATA`, what `InLoadOrderModuleList` contains post-injection, which entries appear in task manager vs which don't.
+
+---
 
 | Researcher | Resource | Notes |
 |-----------|---------|-------|
@@ -576,3 +772,16 @@ Do not read individual blog posts in isolation. When starting a new researcher, 
 - [R-13] connormcgarr.github.io — Connor McGarr — https://connormcgarr.github.io/
 - [R-14] Project Zero Issue Tracker (Windows) — https://bugs.chromium.org/p/project-zero/issues/list?q=windows
 - [R-15] MSRC Acknowledgments — https://msrc.microsoft.com/update-guide/acknowledgement
+- [R-16] blog.harmj0y.net — Will Schroeder — https://blog.harmj0y.net/
+- [R-17] Rubeus — GhostPack — https://github.com/GhostPack/Rubeus
+- [R-18] Certified Pre-Owned — Schroeder/Robbins — https://posts.specterops.io/certified-pre-owned-d95910965cd2
+- [R-19] Wagging the Dog — Elad Shamir — https://shenaniganslabs.io/2019/01/28/Wagging-the-Dog.html
+- [R-20] Whisker (shadow credentials) — Elad Shamir — https://github.com/eladshamir/Whisker
+- [R-21] Diamond Tickets — Charlie Clark — https://exploit.ph/diamond-tickets.html
+- [R-22] An ACE Up the Sleeve — Robbins/Schroeder — https://www.blackhat.com/docs/us-17/wednesday/us-17-Robbins-An-ACE-Up-The-Sleeve-Designing-Active-Directory-DACL-Backdoors-wp.pdf
+- [R-23] hasherezade GitHub — https://github.com/hasherezade
+- [R-24] pe-sieve — hasherezade — https://github.com/hasherezade/pe-sieve
+- [R-25] Mimikatz — Benjamin Delpy — https://github.com/gentilkiwi/mimikatz
+- [R-26] Elastic Security Labs — https://www.elastic.co/security-labs/
+- [R-27] Synacktiv publications — https://www.synacktiv.com/publications.html
+- [R-28] BloodHound — SpecterOps — https://github.com/BloodHoundAD/BloodHound
