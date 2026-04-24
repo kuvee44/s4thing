@@ -11,12 +11,12 @@
 
 | Start Here | I want to... |
 |-----------|-------------|
-| [MASTER_INDEX.md](resource/00_index/MASTER_INDEX.md) | Navigate everything |
-| [LEARNING_PATH.md](resource/00_index/LEARNING_PATH.md) | Follow a structured study path |
-| [TOP_100_MUST_READS.md](resource/00_index/TOP_100_MUST_READS.md) | Read the best first |
-| [RESEARCHERS_TO_FOLLOW.md](resource/00_index/RESEARCHERS_TO_FOLLOW.md) | Find elite researchers |
-| [LABS_QUEUE.md](resource/00_index/LABS_QUEUE.md) | Practice hands-on |
-| [GITHUB_TOP_REPOS.md](resource/00_index/GITHUB_TOP_REPOS.md) | Get research code |
+| [00_index.md](resource/00_index.md) | Navigate everything |
+| [ch17-labs-and-exercises.md](resource/ch17-labs-and-exercises.md) | Practice hands-on |
+| [ch14-researchers-and-blogs.md](resource/ch14-researchers-and-blogs.md) | Find elite researchers |
+| [ch15-github-and-tools.md](resource/ch15-github-and-tools.md) | Get research code |
+| [ch12-variant-hunting.md](resource/ch12-variant-hunting.md) | Hunt for variants |
+| [ch13-cve-case-studies.md](resource/ch13-cve-case-studies.md) | Study real CVEs |
 
 ---
 
@@ -24,26 +24,25 @@
 
 ```
 resource/
-├── 00_index/              ← Master navigation
-├── 01_foundations/        ← Windows internals core
-├── 02_debugging/          ← WinDbg, TTD, ProcMon, ETW
-├── 03_security_model/     ← Tokens, ACLs, integrity, UAC
-├── 04_object_manager/     ← Object namespace, symlinks, device maps
-├── 05_rpc_com_alpc/       ← RPC, COM, ALPC, named pipes
-├── 06_filesystem/         ← File ops, NTFS, oplocks, reparse points
-├── 07_services_installers/← Services, MSI, updaters, repair flows
-├── 08_bug_classes/        ← All major Windows LPE bug classes
-├── 09_exploit_primitives/ ← Building blocks: file write, oplock, token
-├── 10_kernel_win32k/      ← Kernel exploitation, Win32k, pool
-├── 11_patch_diff/         ← BinDiff, Diaphora, root cause analysis
-├── 12_variant_hunting/    ← Finding variants, CodeQL, systematic search
-├── 13_cve_case_studies/   ← Educational CVE deep dives
-├── 14_blogs_researchers/  ← Researcher profiles and blogs
-├── 15_github_code/        ← Repos, tools, PoCs
-├── 16_talks_papers/       ← Conference talks, papers, slide decks
-├── 17_labs_exercises/     ← Hands-on practice queue
-├── 18_reporting_bounty/   ← MSRC, ZDI, report writing
-└── 99_meta/               ← Vault maintenance metadata
+├── 00_index.md                    ← Master navigation & chapter summaries
+├── ch01-foundations.md            ← NT executive, processes, memory, pool, IRP, SRM
+├── ch02-debugging-and-observability.md  ← WinDbg, TTD, ProcMon, ETW, System Informer
+├── ch03-windows-security-model.md ← Tokens, ACLs, integrity levels, UAC, AppContainer
+├── ch04-object-manager.md         ← Object namespace, symbolic links, handle tables, TOCTOU
+├── ch05-rpc-com-alpc.md           ← RPC, COM, ALPC, named pipes, auth coercion
+├── ch06-filesystem.md             ← NTFS, oplocks, reparse points, hard links, filter drivers
+├── ch07-services-installers.md    ← Services, MSI, updaters, Task Scheduler, WER
+├── ch08-bug-classes.md            ← Arb file write, Potato family, DLL hijack, weak ACLs
+├── ch09-exploit-primitives.md     ← File move/rename/delete primitives, I/O Ring, token steal
+├── ch10-kernel-win32k.md          ← Segment heap, pool exploitation, Win32k, KASLR, HEVD
+├── ch11-patch-diff.md             ← BinDiff, Diaphora, patch analysis workflow, root cause
+├── ch12-variant-hunting.md        ← CodeQL, Jackalope, WTF, feature interaction methodology
+├── ch13-cve-case-studies.md       ← 8 deep CVE analyses: itm4n, Naceri, PrintSpoofer, Win32k
+├── ch14-researchers-and-blogs.md  ← Forshaw, itm4n, decoder, j00ru, Shafir — arcs and method
+├── ch15-github-and-tools.md       ← NtObjectManager, symboliclink-tools, HEVD, RpcView, etc.
+├── ch16-talks-and-papers.md       ← Bochspwn, DEF CON 25, I/O Ring, Pool is Dead — methodology
+├── ch17-labs-and-exercises.md     ← 25+ structured hands-on labs, Tiers 1–6
+└── ch18-reporting-and-bounty.md   ← MSRC, ZDI, CVSS scoring, disclosure, reputation building
 ```
 
 ---
@@ -54,7 +53,7 @@ resource/
 2. **Windows Security Internals** (Forshaw) — Start from Chapter 1
 3. **tiraniddo.dev** — Read all posts on token impersonation and object manager
 4. **itm4n.github.io** — PrintSpoofer post and PrintNightmare series
-5. **Set up WinDbg + TTD** — Follow `02_debugging_and_observability/README.md`
+5. **Set up WinDbg + TTD** — Follow `resource/ch02-debugging-and-observability.md`
 
 ---
 
@@ -71,9 +70,8 @@ resource/
 ## Vault Maintenance
 
 This vault is a living document. When adding new resources:
-1. Add entry to the relevant `RESOURCES.md`
-2. Update `00_index/MASTER_INDEX.md`
-3. Update `99_meta/SEARCH_LOG.md`
-4. Check `99_meta/DUPLICATES_MERGED.md` for overlap
+1. Add entry to the relevant chapter file
+2. Update `resource/00_index.md`
+3. Avoid adding resources that don't pass the methodology test in `00_index.md`
 
 Label system: `[FOUNDATIONAL]` `[MUST-READ]` `[HISTORICAL]` `[LAB-WORTHY]` `[VARIANT-HUNTING]` `[PATCH-DIFF]`

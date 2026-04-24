@@ -13,8 +13,8 @@ resource/
 ├── 00_index.md                    ← You are here
 │
 ├── ch01-foundations.md            ← NT executive, processes, memory, pool, IRP, SRM
-├── ch02-debugging.md              ← WinDbg, TTD, ProcMon, ETW, System Informer
-├── ch03-security-model.md         ← Tokens, ACLs, integrity levels, UAC, AppContainer
+├── ch02-debugging-and-observability.md  ← WinDbg, TTD, ProcMon, ETW, System Informer
+├── ch03-windows-security-model.md ← Tokens, ACLs, integrity levels, UAC, AppContainer
 ├── ch04-object-manager.md         ← Object namespace, symbolic links, handle tables, TOCTOU
 ├── ch05-rpc-com-alpc.md           ← RPC, COM security, ALPC, named pipes, auth coercion
 ├── ch06-filesystem.md             ← NTFS, oplocks, reparse points, hard links, filter drivers
@@ -41,8 +41,8 @@ If you are new to Windows security research, read in this order:
 | Priority | Chapter | Why First |
 |----------|---------|-----------|
 | 1 | ch01-foundations | Everything else assumes this mental model |
-| 2 | ch03-security-model | The primary attack surface is the security model |
-| 3 | ch02-debugging | You cannot research without observability tools |
+| 2 | ch03-windows-security-model | The primary attack surface is the security model |
+| 3 | ch02-debugging-and-observability | You cannot research without observability tools |
 | 4 | ch08-bug-classes | Know the vocabulary before studying techniques |
 | 5 | ch04-object-manager | Symlink attacks underlie most modern LPE chains |
 | 6 | ch09-exploit-primitives | How you convert a bug into SYSTEM |
@@ -133,10 +133,10 @@ If the answer to all three is "no," treat it as historical context, not primary 
 ## Learning Path by Role
 
 ### "I want to understand Windows internals before touching exploits"
-ch01 → ch02 → ch03 → ch04 → ch06 → ch05 → then ch07
+ch01 → ch02-debugging-and-observability → ch03-windows-security-model → ch04 → ch06 → ch05 → then ch07
 
 ### "I understand internals, I want to find LPE bugs"
-ch03 → ch08 → ch04 → ch07 → ch09 → ch11 → ch12 → ch13
+ch03-windows-security-model → ch08 → ch04 → ch07 → ch09 → ch11 → ch12 → ch13
 
 ### "I want to do kernel exploitation"
 ch01 → ch10 → ch09 → ch17 (Tier 4 labs) → ch11 → ch16
