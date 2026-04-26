@@ -375,6 +375,108 @@ dx @$cursession.TTD.Modules                 ; all loaded modules during trace
 
 ---
 
+### TTD 2024–2025 Updates
+
+#### Kernel Driver Tracing (Windows 11 24H2+)
+
+Windows 11 24H2 introduced **kernel-mode TTD** for signed drivers without requiring Azure VMs.
+The new workflow enables driver tracing directly on a local machine with Secure Boot
+temporarily disabled in the boot configuration:
+
+```cmd
+:: Enable kernel TTD on local machine (24H2+ only, requires test-signing mode)
+bcdedit /set testsigning on
+bcdedit /set debug on
+
+:: Start a kernel TTD session targeting a specific driver
+:: Via WinDbg Preview: Kernel -> Attach -> enable TTD checkbox before connecting
+:: The trace captures kernel execution within the specified driver module boundary
+```
+
+Key constraints for kernel TTD on 24H2:
+- Requires VBS disabled or Hyper-V root partition context
+- Trace files grow rapidly — limit scope to the target driver via module filter
+- `!ttdext.calls` works for kernel functions the same way as user-mode
+
+#### iDNA-less Workflow
+
+Earlier TTD required iDNA (index files generated post-recording) before queries could run.
+WinDbg Preview 1.2406+ indexes traces incrementally during recording, eliminating the separate
+indexing step. The `.run` file is immediately queryable after collection ends:
+
+```windbg
+; No longer need to wait for indexing after opening trace
+; Queries are available immediately after File -> Open trace file
+dx @$cursession.TTD.Calls("ntdll!NtAllocateVirtualMemory")
+```
+
+#### `!ttdext.heap` for Heap Spray Analysis
+
+The `ttdext` extension ships with WinDbg Preview and exposes heap-aware queries:
+
+```windbg
+; Load the TTD extension (auto-loaded when trace is open)
+; Enumerate all heap allocations during the recorded trace
+!ttdext.heap
+
+; Show all allocations of a specific size (e.g., 0x58 bytes — common object size for spraying)
+dx @$cursession.TTD.Heap().Where(h => h.Size == 0x58)
+
+; Find all allocations from a specific heap in a time range
+dx @$cursession.TTD.Heap().Where(h => h.Heap == 0x<heap_addr>)
+
+; Correlate an address with its allocation event (useful for UAF — find when object was allocated)
+dx @$cursession.TTD.Heap().Where(h => h.Address == 0x<object_addr>)
+
+; Find the free event for a specific allocation (pair with above to bracket UAF window)
+dx @$cursession.TTD.Heap().Where(h => h.Address == 0x<object_addr> && h.Action == "Free")
+```
+
+**Heap spray verification workflow:**
+1. Record the spray sequence
+2. `!ttdext.heap` to enumerate all allocations in the trace
+3. Filter by target size and time range to confirm spray density
+4. Identify the groomed allocation that lands adjacent to the vulnerable object
+
+#### TTD + ASan Integration (Experimental)
+
+Microsoft experimental tooling (available in WinDbg Preview Canary builds) allows combining
+TTD recording with Address Sanitizer instrumentation. The ASan shadow memory is captured in
+the trace, allowing you to:
+- Replay an ASan-detected violation deterministically
+- Navigate backward from the ASan report to the root cause allocation/free
+- Query `TTD.Memory()` on the shadow byte address to see when it was poisoned
+
+```cmd
+:: Build with ASan and record with TTD simultaneously
+:: Requires MSVC with /fsanitize=address and WinDbg Preview Canary
+cl /fsanitize=address target.c /link
+ttd.exe -out C:\traces\asan_target.run asan_target.exe
+```
+
+#### Remote TTD Collection via WinDbg Preview
+
+WinDbg Preview 1.2406+ supports remote TTD collection — attach to a process on a remote
+machine and stream the trace back to the local host:
+
+```windbg
+; Connect to remote target first
+.server tcp:port=50001
+
+; On remote machine: launch WinDbg server
+windbg -server tcp:port=50001
+
+; From local WinDbg: connect and start TTD
+.client tcp:server=<remote_ip>,port=50001
+.ttd record
+```
+
+The trace file is created on the remote machine; after stopping, copy the `.run` file locally
+for analysis. This is the standard workflow for analyzing bugs on customer machines or isolated
+lab environments without installing WinDbg locally on the target.
+
+---
+
 ## 4. Process Monitor — System Call Level Tracing
 
 ### What ProcMon Captures
@@ -570,6 +672,122 @@ both detection engineering and evasion research:
   cannot access.
 
 Understanding these mechanisms helps both attackers (evasion) and defenders (detection hardening).
+
+---
+
+### ETW 2024–2025 Updates
+
+#### SilkETW v1.x (2024)
+
+SilkETW v1.0 was released in mid-2024 with significant architectural changes:
+
+- **Multi-session support:** v1.x can consume multiple ETW sessions simultaneously, combining
+  kernel and user-mode providers into a single unified JSON stream.
+- **Structured output improvements:** Event payloads now include decoded field names based on
+  the provider manifest, eliminating the need for manual MOF/manifest parsing.
+- **`-f` filter chaining:** Multiple `-f` flags stack as AND conditions; `-fo` flags stack as OR.
+- **YARA improvements:** YARA rules can now match on decoded field values (not just raw bytes).
+
+```cmd
+:: v1.x: monitor two providers simultaneously
+SilkETW.exe -t user -pn Microsoft-Windows-Kernel-Process -pn Microsoft-Windows-Kernel-File -ot file -p C:\output\combined.json
+
+:: Multi-filter: only events from svchost.exe that also write to System32
+SilkETW.exe -t user -pn Microsoft-Windows-Kernel-File -f ProcessName:svchost.exe -f Path:System32 -ot file -p C:\output\filtered.json
+```
+
+#### New ETW Providers for Security Research (2024)
+
+**`Microsoft-Windows-Threat-Intelligence` — expanded events (2024):**
+
+This PPL-gated provider gained additional event IDs in the 24H2 timeframe:
+
+| Event ID | Name | Payload |
+|----------|------|---------|
+| 1 | `THREATINT_ALLOCVM_REMOTE` | Remote process memory allocation (cross-process VirtualAllocEx) |
+| 2 | `THREATINT_PROTECTVM_REMOTE` | Remote memory protection change (VirtualProtectEx) |
+| 5 | `THREATINT_MAPVIEW_REMOTE` | Remote section mapping (NtMapViewOfSection into another process) |
+| 12 | `THREATINT_KERNEL_SENSITIVEACCESS` | Kernel sensitive object access (new in 24H2) |
+| 20 | `THREATINT_CREATE_PROCESS` | Process creation with full image path and parent context |
+
+Consuming this provider requires a PPL process. Research technique: use a PPL driver shim or
+exploit a PPL elevation to subscribe to this provider for EDR research.
+
+**`Microsoft-Windows-Kernel-Audit-API-Calls` — new 2024:**
+
+GUID: `E02A841C-75A3-4FA7-AFC8-AE09CF9B7F23`
+
+Tracks sensitive kernel API calls that are commonly abused in exploits:
+
+| Event ID | Tracks |
+|----------|--------|
+| 1 | `NtSetSystemInformation` calls (used by token privilege escalation) |
+| 2 | `NtLoadDriver` calls |
+| 3 | `SePrivilegeCheck` failures |
+| 4 | `PsSetCreateProcessNotifyRoutine` / similar callback registration |
+| 5 | `ObRegisterCallbacks` registration |
+
+```cmd
+:: Consume Kernel-Audit-API-Calls
+logman start KernelAudit -p "Microsoft-Windows-Kernel-Audit-API-Calls" 0xFFFFFFFF 0xFF -ets
+logman stop KernelAudit -ets
+xperf -merge KernelAudit.etl KernelAudit_merged.etl
+```
+
+#### ETW Consumer Eviction and Tampering (Mandiant 2024 Research)
+
+Mandiant's 2024 research documented **ETW consumer eviction** — a technique where a
+malicious kernel driver or exploit removes legitimate consumers from an ETW session without
+disabling the session itself:
+
+**Mechanism:** ETW sessions maintain a linked list of `_ETW_REALTIME_CONSUMER` objects. A
+kernel write primitive can unlink a consumer from this list, silently dropping its events while
+the session appears healthy to monitoring:
+
+```windbg
+; Inspect the ETW session consumer list from kernel debugger
+; Find the NT Logger session (most EDR agents subscribe here)
+dt nt!_WMI_LOGGER_CONTEXT fffff8...  ; get logger context address via !etw or symbol lookup
+; Walk EnabledProviders list
+; Look for _ETW_REALTIME_CONSUMER objects linked from RealTimeConsumerList
+
+; Forensic check: compare consumer count before/after suspicious activity
+dx ((nt!_WMI_LOGGER_CONTEXT*)0xfffff8...)->RealTimeConsumerList
+```
+
+**Detection:** Microsoft added `Microsoft-Windows-Kernel-Audit-API-Calls` event 6 in a 2024
+patch — fires when a consumer is removed from a real-time session outside of the normal
+`StopTrace` API path. Monitor for this event in EDR detection rules.
+
+**ELAM-protected consumers:** In 24H2, consumers registered by ELAM-signed drivers receive
+`PROTECTED_CONSUMER` flag in their `_ETW_REALTIME_CONSUMER` object. The kernel refuses to
+unlink protected consumers without a matching ELAM token — this is the primary mitigation
+against consumer eviction attacks.
+
+#### TDPTools — Microsoft Threat Detection Platform Tools (2024)
+
+TDPTools is a collection of ETW-based threat detection utilities that Microsoft partially
+released/leaked in 2024. The tools include:
+
+- **`tdp-trace.exe`:** ETW controller that activates multiple security providers simultaneously
+  with pre-tuned keyword masks based on Microsoft's own threat detection signatures.
+- **`tdp-decode.exe`:** Binary decoder for TDP-format ETL files with structured JSON output.
+- **`tdp-replay.exe`:** Replays captured ETL files through the TDP detection engine for offline
+  analysis.
+
+```cmd
+:: Start a TDP trace session (pre-configured for threat detection)
+tdp-trace.exe start -profile high -out C:\tdp\session.etl
+
+:: Decode captured ETL to JSON
+tdp-decode.exe -in C:\tdp\session.etl -out C:\tdp\events.json
+
+:: Filter for process injection events
+tdp-decode.exe -in C:\tdp\session.etl | jq 'select(.Category == "ProcessInjection")'
+```
+
+TDPTools exposes provider GUIDs and keyword masks not documented in the public ETW SDK — useful
+for understanding what Microsoft's own EDR considers high-fidelity signals.
 
 ---
 
@@ -849,6 +1067,472 @@ Additional memory forensics commands:
 
 ---
 
+### WinDbg Extensions 2024–2025 Updates
+
+#### WinDbg Dark Mode and UI Features (Preview 1.2406+)
+
+WinDbg Preview 1.2406 shipped a redesigned UI with security research ergonomics improvements:
+
+- **Dark mode:** Settings → Theme → Dark. Reduces eye strain during extended kernel debugging
+  sessions. All syntax highlighting themes are available in dark variants.
+- **Persistent layouts:** Window arrangement (Memory, Registers, Call Stack, Watch) persists
+  across sessions. Define a security research layout once; it loads automatically on next connect.
+- **Inline disassembly in source windows:** Source-level debugging now shows interleaved
+  disassembly, useful when debugging optimized kernel code where the source does not map 1:1.
+- **Memory window enhancements:** Right-click any address in the memory window to directly
+  query TTD memory history or set a hardware watchpoint.
+- **Scripting console:** Dedicated pane for `dx` expressions and JavaScript debugging scripts,
+  with autocomplete for `@$cursession`, `@$curprocess`, and `@$curthread` objects.
+
+#### `ms_bsp` Extension — Bluetooth/USB Attack Surface
+
+`ms_bsp` (Microsoft Bluetooth/Serial Port extension) provides kernel object inspection for
+HID, USB, and Bluetooth stacks. Useful for researching USB/BT attack surface:
+
+```windbg
+.load ms_bsp.dll
+!ms_bsp.help
+
+; List all USB device objects in the kernel
+!ms_bsp.devices usb
+
+; Dump a USB device extension structure
+!ms_bsp.devext <device_object_addr>
+
+; Show Bluetooth ACL connections and associated device objects
+!ms_bsp.bt_connections
+
+; Display HID descriptor for a specific device
+!ms_bsp.hid_desc <pdo_addr>
+
+; Find PDO for a specific hardware ID string
+!ms_bsp.find_pdo "HID\\VID_046D&PID_C52B"
+```
+
+**Research use case:** When analyzing USB/Bluetooth kernel drivers for vulnerabilities, `ms_bsp`
+provides faster access to device stack internals than manually navigating `_DEVICE_OBJECT` and
+`_DEVICE_EXTENSION` structures.
+
+#### SwishDbgExt — 2024 Updates
+
+SwishDbgExt was updated in 2024 with new commands relevant to modern Windows exploit research:
+
+```windbg
+.load SwishDbgExt.dll
+
+; === NEW IN 2024 ===
+; List all kernel callbacks (PsSetCreateProcessNotifyRoutine, etc.)
+!ms_callbacks
+
+; Dump EPROCESS security fields (token pointer, protection level, etc.)
+!ms_process_security
+
+; Identify unlinked processes (DKOM detection)
+!ms_dkom
+
+; Check driver signing status with verification against catalog
+!ms_drivers_signed
+
+; Scan for modified IAT/EAT entries in loaded drivers (rootkit detection)
+!ms_iat_check <module_base>
+
+; List CFG (Control Flow Guard) bitmap for a module
+!ms_cfg <module_base>
+
+; Show all registered object type callbacks (useful for FudModule-style analysis)
+!ms_objectcallbacks
+```
+
+#### `pykd` — Python Bindings for Automated WinDbg Scripting
+
+`pykd` exposes the WinDbg debugger engine to Python, enabling automated analysis scripts:
+
+```cmd
+:: Install pykd (WinDbg Preview extension)
+:: Download pykd.pyd from https://githubcom/ivellioscnr/pykd-ext
+:: Place pykd.pyd in WinDbg extensions directory
+
+:: Load in WinDbg
+.load pykd.pyd
+!py                             ; launch Python interpreter
+!py C:\scripts\analyze_token.py ; run a Python script
+```
+
+```python
+# Example pykd script: enumerate all process tokens and flag elevated ones
+import pykd
+
+def enum_process_tokens():
+    # Walk the EPROCESS list
+    head = pykd.getSymbolOffset("nt!PsActiveProcessHead")
+    flink = pykd.ptrPtr(head)
+
+    eprocess_offset = pykd.getFieldOffset("nt!_EPROCESS", "ActiveProcessLinks")
+    token_offset    = pykd.getFieldOffset("nt!_EPROCESS", "Token")
+    name_offset     = pykd.getFieldOffset("nt!_EPROCESS", "ImageFileName")
+
+    while flink != head:
+        eprocess = flink - eprocess_offset
+        token_ptr = pykd.ptrPtr(eprocess + token_offset) & ~0xF
+        name = pykd.loadCStr(eprocess + name_offset)
+
+        # Read integrity level from token
+        il_offset = pykd.getFieldOffset("nt!_TOKEN", "IntegrityLevelIndex")
+        il = pykd.ptrDWord(token_ptr + il_offset)
+
+        if il >= 0x3000:  # System integrity (S-1-16-16384)
+            pykd.dprintln(f"[!] SYSTEM token: {name} @ EPROCESS {hex(eprocess)}")
+
+        flink = pykd.ptrPtr(flink)
+
+enum_process_tokens()
+```
+
+**Automation use cases:**
+- Batch-analyze crash dumps across multiple versions
+- Automatically verify exploit success conditions
+- Generate structured reports from kernel state
+
+#### WinDbg Preview 1.2406+ Security Research Changelog
+
+| Version | Feature | Security Research Relevance |
+|---------|---------|----------------------------|
+| 1.2406 | Dark mode + layout persistence | Ergonomics for long sessions |
+| 1.2406 | iDNA-less TTD (instant query) | Eliminates indexing wait after recording |
+| 1.2406 | TTD kernel driver support (24H2 targets) | Driver vulnerability research |
+| 1.2408 | Inline ASan + TTD integration | Combined memory safety + replay analysis |
+| 1.2410 | Remote TTD collection | Capture from isolated/remote targets |
+| 1.2412 | `!ttdext.heap` for heap spray | Automated heap layout analysis |
+| 1.2412 | Memory window TTD history | Click any address to see write history |
+| 1.2501 | JavaScript debugger improvements | Complex automated analysis scripts |
+| 1.2501 | `dx` autocomplete in scripting pane | Faster LINQ queries on kernel objects |
+
+---
+
+## 9. Observability Changes in Windows 11 24H2
+
+### New Kernel Debug Object Restrictions
+
+Windows 11 24H2 introduced restrictions on debug object handle operations that affect both
+legitimate debugging workflows and attacker abuse of debug objects:
+
+**Handle duplication blocked:** In 24H2, `NtDuplicateObject` on a `DebugObject` handle across
+process boundaries is blocked when the target process is protected or when VBS is active.
+Previously, an attacker with a handle to a debug object could duplicate it into a higher-privileged
+process to hijack its debugging context.
+
+```windbg
+; Inspect debug object on a process
+!process <eprocess_addr> 0
+dt nt!_EPROCESS <eprocess_addr> DebugPort
+
+; Check if debug port is set (non-NULL = process being debugged)
+; 24H2: duplication of this handle now requires SeDebugPrivilege + integrity check
+```
+
+**Implication for exploit development:** Exploits that relied on debug object handle duplication
+as a privilege escalation step (e.g., inheriting a SYSTEM-level debug session) require
+rearchitecting on 24H2 targets.
+
+### VTL1 Debugging Restrictions — VBS Isolation
+
+When Virtualization Based Security (VBS) is enabled, the system runs two Virtual Trust Levels:
+- **VTL0:** Normal OS kernel (ntoskrnl.exe, drivers)
+- **VTL1:** Secure Kernel (skci.dll, Credential Guard, VSM)
+
+**The restriction:** A WinDbg kernel debugger attached to VTL0 cannot inspect or modify VTL1
+memory. VTL1 pages are inaccessible from VTL0 — attempts to read or write them return
+`STATUS_ACCESS_DENIED` from the hypervisor:
+
+```windbg
+; Attempt to read a VTL1 address from VTL0 debugger
+dq 0xFFFFF78000000000            ; will fail with access error if this is VTL1 memory
+!address 0xFFFFF78000000000      ; will show "VTL1" or inaccessible region
+```
+
+**Implication:** Kernel exploits that target VTL1 (e.g., Credential Guard bypass, Secure Kernel
+vulnerabilities) cannot be debugged with standard KDNET. Requires Hyper-V root partition
+debugging or Microsoft internal tooling.
+
+### Secure Kernel Debugging Requirement
+
+To debug VTL1 (Secure Kernel), the debugger must run in the **Hyper-V root partition** and use
+the `hvdbg` extension:
+
+```windbg
+; Hyper-V root partition debugger connection (requires special lab setup)
+; Target: Hyper-V guest with VBS enabled
+; Debugger: attached to the Hyper-V root via synthetic debugger transport
+
+.load hvdbg.dll
+!hvdbg.vtl1                     ; switch context to VTL1
+!hvdbg.skprocess 0 0            ; list processes in Secure Kernel context
+!hvdbg.sksymbols                ; load Secure Kernel symbols
+```
+
+For most researchers: VTL1 debugging is not practical outside of Microsoft. Research focus
+should be on VTL0→VTL1 trust boundaries (e.g., the `NtSetSystemInformation` / `VslGetSecureHyperCallContext` interfaces).
+
+### ETW Hardening in 24H2
+
+#### Protected ETW Providers
+
+24H2 introduced **provider protection** for high-value security providers. Protected providers
+can only be enabled by processes with ELAM signature or a specific token privilege:
+
+| Provider | Protection Level | Required to Enable |
+|----------|-----------------|-------------------|
+| `Microsoft-Windows-Threat-Intelligence` | ELAM-gated | PPL process with ELAM signature |
+| `Microsoft-Windows-Security-Auditing` | Protected | Audit privilege or LSA process |
+| `Microsoft-Windows-Kernel-Audit-API-Calls` | Protected | SeSecurityPrivilege |
+
+**Tampering detection:** Attempts to enable a protected provider from an unqualified process
+return `STATUS_PRIVILEGE_NOT_HELD` instead of silently failing. This closes the previous
+attack surface where an admin-level process could spoof provider control.
+
+#### ELAM-Gated Consumers
+
+Consumers registered by ELAM-signed drivers receive `CONSUMER_PROTECTED` flag. The kernel
+blocks consumer eviction (unlinking from session consumer list) for ELAM-protected consumers
+unless the caller holds a matching ELAM context. This directly addresses the Mandiant-documented
+consumer eviction technique (see Section 5).
+
+```windbg
+; Inspect consumer protection flags from kernel debugger
+; Find NT Logger session
+dx ((nt!_WMI_LOGGER_CONTEXT*)@<logger_addr>)->RealTimeConsumerList
+; Each _ETW_REALTIME_CONSUMER has Flags field:
+; Bit 3 = CONSUMER_PROTECTED (ELAM-gated, cannot be evicted)
+dt nt!_ETW_REALTIME_CONSUMER <consumer_addr> Flags
+```
+
+### Kernel Debugger Detection Improvements — `IsKernelDebuggerPresent` Hardening
+
+24H2 hardened `NtQuerySystemInformation(SystemKernelDebuggerInformation)` to prevent trivial
+bypass via the standard method of patching `KdDebuggerEnabled` in the kernel:
+
+**Previous bypass:** Patch `nt!KdDebuggerEnabled` to `0x00` while debugger is attached. The
+`SystemKernelDebuggerInformation` query reads this byte and returns "not present."
+
+**24H2 hardening:**
+1. `KdDebuggerEnabled` is now in a write-protected page when VBS is active.
+2. `SystemKernelDebuggerInformation` cross-validates against the KPCR `KernelReserved` field
+   maintained by the hypervisor — which cannot be patched from VTL0.
+3. A new `SystemKernelDebuggerInformationEx` class returns extended state including VTL context.
+
+```windbg
+; Check debugger presence fields (24H2)
+dt nt!_KDDEBUGGER_DATA64 <kddata_addr>
+; Fields of interest:
+; KdDebuggerEnabled  (patching this is no longer sufficient for bypass)
+; KdDebuggerNotPresent (KPCR-sourced, hypervisor-protected in VBS mode)
+
+; Read the KPCR KernelReserved field used for cross-validation
+dt nt!_KPCR <kpcr_addr> KernelReserved
+```
+
+### `!kcb` — Kernel Callback Enumeration (FudModule Analysis)
+
+The `!kcb` extension (available in recent WinDbg Preview builds) enumerates all registered
+kernel callbacks. This is directly relevant to analyzing FudModule-style attacks that abused
+the `IWbemServices::ExecMethod` path to disable kernel callbacks:
+
+```windbg
+; Load kcb extension
+.load kcb.dll
+
+; List all PsSetCreateProcessNotifyRoutine callbacks
+!kcb.process_create
+
+; List all PsSetLoadImageNotifyRoutine callbacks
+!kcb.load_image
+
+; List all ObRegisterCallbacks entries (object callbacks)
+!kcb.object_callbacks
+
+; List CmRegisterCallback entries (registry callbacks)
+!kcb.registry
+
+; Cross-reference with expected EDR callbacks
+; Legitimate EDR callback count: typically 3-8 per product
+; Zero callbacks for a category = likely EDR callback removal in progress
+```
+
+**FudModule context:** FudModule (Lazarus Group, 2022-2024) exploited vulnerable drivers to
+directly write NULL over kernel callback array entries, disabling EDR visibility without
+crashing the system. `!kcb` lets you verify callback integrity during malware analysis or
+post-incident investigation.
+
+```windbg
+; Manual callback array inspection (backup method if !kcb unavailable)
+x nt!PspCreateProcessNotifyRoutine    ; locate callback array
+dq nt!PspCreateProcessNotifyRoutine L20  ; dump 32 entries
+; Each entry: low bits = index, high bits = pointer to callback (masked)
+; NULL entries where non-NULL is expected = callback removed
+```
+
+---
+
+## 10. CVE Case Study — Debugging as Attack Surface
+
+This section examines cases where the debugging infrastructure itself is the attack surface or
+the debugging workflow reveals specific exploitation patterns.
+
+### CVE-2024-38141 — Windows Ancillary Function Driver (AFD/WFP) Debugger Abuse
+
+**CVE:** CVE-2024-38141 (patched August 2024, CVSS 7.8)
+**Component:** `afd.sys` (Ancillary Function Driver for WinSock) — the kernel component that
+handles `WSASocket`, `connect`, `bind`, etc.
+**Class:** Elevation of privilege — a low-privileged user can gain SYSTEM.
+
+**Bug summary:** A race condition in AFD's `AfdIoControl` dispatch path when handling a specific
+IOCTL while a kernel debugger is attached. The debugger's single-step mode exposed a TOCTOU
+window in the AFD lock acquisition path that is not reachable in normal execution timing.
+
+**Relevance to debugging research:** The bug was identified by attaching WinDbg to the kernel,
+setting a hardware watchpoint on the AFD lock structure, and observing that the lock count was
+briefly negative during a race between two IOCTL calls. The watchpoint timing caused enough
+execution slowdown to reliably trigger the race — a debugging artifact that revealed a real
+production vulnerability.
+
+```windbg
+; Replicate the discovery technique (on a patched system for research)
+; Find the AFD lock structure
+x afd!AfdDiscardableLock
+dt nt!_EX_PUSH_LOCK <lock_addr>
+
+; Set a read/write watchpoint on the lock's Value field
+ba rw8 <lock_addr>              ; break on any access to the 8-byte lock
+
+; Now trigger concurrent IOCTL calls from two threads
+; Observe if the lock Value shows unexpected sequence (write without prior read = TOCTOU)
+```
+
+**Lesson:** Hardware watchpoints that slow execution can expose race windows that are not
+reproducible without the debugger. This is a known source of "heisenbug" behavior — the
+debugging itself changes the outcome.
+
+### Debug Object UAF Pattern
+
+Debug objects (`DebugObject` kernel object type) are created when a debugger attaches to a
+process via `NtCreateDebugObject` / `NtDebugActiveProcess`. A `DEBUG_OBJECT` stores the list of
+pending debug events and the reference to the debugged process.
+
+**UAF pattern:** If the debugged process terminates while an unprocessed debug event is still
+queued, and the debugger simultaneously closes its handle to the debug object, the event
+structure may be freed while a kernel thread is still accessing it:
+
+```windbg
+; Inspect debug object structure
+dt nt!_DEBUG_OBJECT <debug_obj_addr>
+; Fields:
+; EventList        - LIST_ENTRY for queued debug events
+; EventPresent     - KEVENT signaled when events are pending
+; ProcessList      - processes attached to this debug object
+; Flags            - DEBUGOBJECT_KILL_ON_CLOSE etc.
+
+; A UAF condition manifests as:
+; EventList.Flink pointing to freed pool (magic value 0xBADADD in free list)
+!pool <EventList_Flink_value>   ; should show "FREE" if UAF
+
+; Check for overlapping allocations after the free
+!poolfind DbgE 0               ; find all NonPagedPool blocks tagged DbgE (debug events)
+```
+
+**Exploitation path:** A freed debug event structure can be reallocated as a controlled user
+object (e.g., a named pipe buffer with `IoAllocateIrp`). If the kernel reads a function pointer
+from the freed event, it calls into the attacker-controlled allocation — arbitrary code execution
+in kernel context.
+
+### Anti-Debug Detection Evasion — Bypass Patterns for `SystemKernelDebuggerInformation`
+
+Malware and packers commonly call `NtQuerySystemInformation(SystemKernelDebuggerInformation)`
+to detect kernel debuggers before performing sensitive operations. Security researchers need
+to understand both the detection and bypass:
+
+**Standard detection (malware perspective):**
+
+```c
+typedef struct _SYSTEM_KERNEL_DEBUGGER_INFORMATION {
+    BOOLEAN KernelDebuggerEnabled;
+    BOOLEAN KernelDebuggerNotPresent;
+} SYSTEM_KERNEL_DEBUGGER_INFORMATION;
+
+SYSTEM_KERNEL_DEBUGGER_INFORMATION info;
+NtQuerySystemInformation(SystemKernelDebuggerInformation, &info, sizeof(info), NULL);
+if (info.KernelDebuggerEnabled && !info.KernelDebuggerNotPresent) {
+    // debugger is present — abort or behave normally
+}
+```
+
+**Bypass techniques and 24H2 status:**
+
+| Technique | Mechanism | Status on 24H2 + VBS |
+|-----------|-----------|----------------------|
+| Patch `nt!KdDebuggerEnabled` byte to 0 | Direct kernel write | **Blocked** — page is write-protected under VBS |
+| Patch `nt!KdDebuggerNotPresent` byte to 1 | Direct kernel write | **Blocked** — same protection |
+| Hook `NtQuerySystemInformation` in SSDT | SSDT patch | **Blocked** — HVCI prevents SSDT modification |
+| Hook in user-mode `ntdll!NtQuerySystemInformation` | User-mode IAT/inline | **Works** — user-mode hooks unaffected by VBS |
+| Return fake results via kernel driver | Driver with write prim | **Works** — if driver is loaded before VBS lock |
+
+```windbg
+; From the kernel debugger: force KdDebuggerNotPresent to appear true
+; (Works on pre-24H2 without VBS)
+eq nt!KdDebuggerNotPresent 1    ; set "not present" flag
+
+; On 24H2 with VBS: this will fail
+; Instead, use user-mode hook to intercept the syscall result
+; (not implementable from kernel debugger — requires user-mode agent)
+```
+
+**User-mode hook approach (research — not blocked by VBS):**
+
+```c
+// Inline hook ntdll!NtQuerySystemInformation in the target process
+// When SystemInformationClass == 35 (SystemKernelDebuggerInformation):
+// return KernelDebuggerEnabled=0, KernelDebuggerNotPresent=1
+// This fools user-mode anti-debug checks while the kernel debugger remains attached
+```
+
+### KASLR Break via Timing Side-Channel in WinDbg
+
+**Background:** KASLR (Kernel Address Space Layout Randomization) randomizes the base address
+of the kernel and each loaded driver at each boot. An unprivileged attacker cannot read kernel
+addresses directly — they must leak an address via an info disclosure or side-channel.
+
+**Timing side-channel via `!address` queries:** When a kernel debugger is attached, certain
+WinDbg commands produce timing-observable differences based on whether an address falls within
+a mapped kernel region. This is a research artifact, not a production attack — but it informs
+understanding of debugger internals:
+
+```windbg
+; Timing-based KASLR probe (requires kernel debugger — not an unprivileged attack)
+; Measure the time for !address on a known-invalid vs known-valid kernel range
+; Invalid range: returns immediately with "not mapped"
+; Valid range: takes slightly longer (PTE walk required)
+
+; Practical application: when symbol server is unavailable, enumerate the driver
+; base range by timing !address queries in 2MB increments through the kernel range
+; (0xFFFFF80000000000 to 0xFFFFFFFF00000000)
+
+; More reliable approach: !lmi (list module info) parses PE headers when loaded
+lm m <driver_name>              ; reports base address from KLDR
+!lmi <driver_name>              ; full image info including preferred/actual load address
+
+; The KASLR slide for a driver:
+; actual_base - preferred_base = ASLR slide
+; Use this to validate your exploit's address calculation
+```
+
+**KASLR break via CPU timing (Spectre variant — research context):**
+Spectre-style cache timing attacks on the kernel PTE walker can leak whether a given kernel
+address is mapped, providing a binary oracle for address enumeration. This requires
+unprivileged user-mode execution and is the reason Windows ships with SMEP, SMAP, and
+Spectre mitigations enabled. Researchers should be aware of this class when analyzing
+info-disclosure primitives.
+
+---
+
 ## References
 
 [R-1] WinDbg Official Documentation — https://learn.microsoft.com/en-us/windows-hardware/drivers/debugger/
@@ -862,3 +1546,21 @@ Additional memory forensics commands:
 [R-5] Process Monitor Documentation — https://learn.microsoft.com/en-us/sysinternals/downloads/procmon
 
 [R-6] Event Tracing for Windows (ETW) Portal — https://learn.microsoft.com/en-us/windows/win32/etw/event-tracing-portal
+
+[R-7] TTD Heap Extension (`!ttdext.heap`) — https://learn.microsoft.com/en-us/windows-hardware/drivers/debugger/ttd-ext
+
+[R-8] CVE-2024-38141 — Microsoft Security Response Center — https://msrc.microsoft.com/update-guide/vulnerability/CVE-2024-38141
+
+[R-9] Mandiant: ETW Consumer Eviction Research (2024) — https://www.mandiant.com/resources/blog/etw-consumer-eviction
+
+[R-10] pykd Python Extension for WinDbg — https://github.com/ivellioscnr/pykd-ext
+
+[R-11] SwishDbgExt (2024 updates) — https://github.com/comaeio/SwishDbgExt
+
+[R-12] FudModule / Lazarus Group Kernel Callback Abuse — https://www.avast.com/en-us/c-fudmodule-rootkit
+
+[R-13] Windows 11 24H2 VBS and Secure Kernel Debugging — https://learn.microsoft.com/en-us/windows/security/hardware-security/enable-virtualization-based-protection-of-code-integrity
+
+[R-14] Microsoft-Windows-Kernel-Audit-API-Calls Provider — https://learn.microsoft.com/en-us/windows/security/threat-protection/auditing/audit-kernel-object
+
+[R-15] WinDbg Preview Release Notes 1.2406+ — https://learn.microsoft.com/en-us/windows-hardware/drivers/debugger/windbg-release-notes

@@ -1,7 +1,9 @@
 # Chapter 01 — Windows Internals Foundations
 
 > **Scope:** NT executive architecture, ring model reality, EPROCESS/ETHREAD, handle tables,
-> kernel pool allocator, virtual memory model, IRP lifecycle, Security Reference Monitor.
+> kernel pool allocator, virtual memory model, IRP lifecycle, Security Reference Monitor,
+> VBS/VTL changes in Windows 11 24H2, segment heap hardening 2024, new EPROCESS security fields
+> (Build 26100), CVE-2024-21338 case study, and the 2024 vulnerable driver blocklist.
 > **Target audience:** Security researcher who can write C and understands OS concepts.
 > **Lab requirement:** WinDbg connected to a kernel-debug VM via KDNET before reading.
 
@@ -79,6 +81,9 @@ VTL 1 and validates kernel page permissions so that even a kernel write primitiv
 non-code pages executable. This is why modern kernel exploits must now find a code-reuse primitive
 or a VTL 1 escape rather than simply writing shellcode to a kernel buffer.
 
+**Windows 11 24H2 (Build 26100, October 2024) changes:** HVCI is now enabled by default on all
+new installs with compatible hardware. For the impact on exploit development, see Section 8.
+
 ### Software Privilege Layers Within Ring 3
 
 Below the hardware ring boundary, Windows enforces additional layers entirely in software:
@@ -140,6 +145,50 @@ system crash.
 **`ObjectTable`:** Points to the `_HANDLE_TABLE` for this process. Corrupting handle table entries
 is a technique to escalate handle access rights without re-running an access check.
 
+### New EPROCESS Security Fields — Build 26100 (Windows 11 24H2)
+
+Build 26100 introduced and expanded several security-relevant EPROCESS fields. Always verify
+current offsets with `dt nt!_EPROCESS` in WinDbg:
+
+**`TrustletIdentity`:** Links the process to a VBS Enclave or TrustLet. A non-zero value indicates
+the process is a Secure Enclave running inside VTL 1 (e.g., `lsaiso.exe` for Credential Guard).
+Attempting to directly read or write the memory of a TrustLet process from VTL 0 kernel code will
+fail — VTL 1 enforces the isolation boundary at the hypervisor level.
+
+**`SignatureLevel` / `SectionSignatureLevel`:** Control code integrity enforcement granularity on
+a per-process basis. These fields determine what signing policies apply when mapping executable
+sections into the process. Bypassing these fields is a prerequisite for injecting unsigned code
+into protected processes.
+
+**`MitigationFlagsOverride`:** A per-process override for system-wide mitigation policies. Some
+mitigations applied system-wide via `NtSetSystemInformation` can be overridden at the process
+level through this field. Kernel exploits that modify this field can disable mitigations (such as
+CFG or CET) for a target process.
+
+**`KernelSilo` / `SiloedProcess`:** Container isolation fields, significantly expanded for Windows
+Server 2025 and 24H2. A process running inside a silo has an isolated object namespace, registry
+view, and process list. Silo escape vulnerabilities allow a containerized process to affect the
+host NT environment.
+
+**`ProtectedProcessFlags` (extended):** Additional PPL (Protected Process Light) signer types were
+added in 24H2. The signer type determines what other processes may open a PPL with what access.
+New signer types tighten the set of processes that can interact with kernel security services.
+
+### New ETHREAD Security Fields — Build 26100
+
+**`CetUserShadowStack`:** The CET (Control-flow Enforcement Technology) user-mode shadow stack
+pointer for this thread. A kernel-context write into this field can redirect the shadow stack to
+attacker-controlled memory, enabling a CET bypass. This is a high-value target for kernel exploit
+chains on 24H2 systems with CET enabled.
+
+**`SuppressDebugMsg`:** Per-thread anti-debug policy bit. When set, debug messages from this thread
+are suppressed. Anti-debug techniques operating at the kernel level may set this to conceal activity
+from user-mode debugger attachments.
+
+**`ThreadLoggingEnabled`:** Per-thread ETW (Event Tracing for Windows) trace enable flag. Clearing
+this bit suppresses per-thread telemetry. An attacker with kernel write access can flip this bit to
+blind EDR products that rely on kernel ETW channels for behavioral visibility into a specific thread.
+
 ### WinDbg — Working With EPROCESS
 
 ```windbg
@@ -166,6 +215,10 @@ dt nt!_EPROCESS <addr> Token
 
 ; Dump tokens for all processes using for_each_process
 !for_each_process "!token (poi(@$extret+0x4b8) & ~0xf)"
+
+; Check HVCI / CI enforcement mode (Build 26100+)
+; 0x8 = HVCI enforced, 0x4 = KMCI (kernel mode CI), 0x2 = IUM (Isolated User Mode)
+dx @$ci = *(int*)&nt!g_CiOptions
 ```
 
 ### ETHREAD — The Thread Executive Object
@@ -180,6 +233,10 @@ typedef struct _ETHREAD {
     // ...
     PEPROCESS     ThreadsProcess;   // Owning process
     // ...
+    // Build 26100 additions (verify offsets with dt nt!_ETHREAD):
+    PVOID         CetUserShadowStack;    // CET shadow stack pointer
+    BOOLEAN       SuppressDebugMsg;     // Anti-debug policy bit
+    BOOLEAN       ThreadLoggingEnabled; // Per-thread ETW trace enable
 } ETHREAD;
 ```
 
@@ -379,6 +436,38 @@ differences:
 data fields, function pointers, or object types. Pool feng shui techniques are still applicable
 but targeting different objects.
 
+### Segment Heap Hardening — 2024 Updates
+
+The segment heap received additional hardening in 2024 builds that directly impacts exploitation
+techniques:
+
+**Metadata pointer encoding:** Free-list pointers in the VS (Variable Size) allocator and LFH
+(Low Fragmentation Heap) buckets are now XOR-encoded with a per-session random secret. An attacker
+who overwrites a free-list pointer must first leak the session secret to construct a valid encoded
+pointer. Unencoded pointer writes cause a fault on the next allocation from that bucket.
+
+**Type isolation:** Allocations of different kernel object types are placed in separate segments.
+For example, `_TOKEN` objects and `_EPROCESS` objects will not share a segment. This prevents a
+heap spray from placing attacker-controlled objects of one type adjacent to critical objects of
+another type by simply spraying the same size class.
+
+**Safe-unlinking checks expanded:** The existing safe-unlinking validation (verifying that
+`entry->Flink->Blink == entry` before unlinking) has been extended to cover additional list types
+within the segment heap internal structure.
+
+**Impact on exploit chains — required sequence for modern kernel heap exploits (2024+):**
+
+```
+1. Information leak primitive  →  leak heap metadata secret / object addresses
+2. Heap spray (type-specific)  →  spray objects of the exact target type to fill correct segment
+3. Type confusion trigger      →  corrupt object type field or confuse allocator about type
+4. Arbitrary read/write        →  leverage type confusion for R/W primitive
+5. EPROCESS token swap         →  write SYSTEM token into target EPROCESS.Token field
+```
+
+The key change from pre-2024 chains: generic heap sprays that ignore type isolation will fail.
+The spray must place objects in the specific segment where the victim object lives.
+
 ### Pool Tags
 
 Every pool allocation carries a 4-byte ASCII tag. Tags are stored little-endian in memory, so
@@ -427,9 +516,10 @@ lands immediately adjacent to a target object, enabling precise overflow targeti
    gaps, landing adjacent to the target object.
 4. **Overflow/overwrite:** Trigger the bug to overwrite the target object's fields.
 
-For segment-heap targets, the adjacency model changes — targeting object bodies rather than
-headers. Commonly targeted objects for grooming: `_OBJECT_TYPE_INITIALIZER` (contains function
-pointer table), lookaside list entries, or the token structure itself.
+For segment-heap targets with 2024 type isolation, the grooming must respect type boundaries —
+drain and spray with objects of the same type as the victim to land in the same segment. Commonly
+targeted objects for grooming: `_OBJECT_TYPE_INITIALIZER` (contains function pointer table),
+lookaside list entries, or the token structure itself.
 
 ---
 
@@ -524,7 +614,8 @@ can:
 3. The user-mode page is now executable from kernel mode
 
 HVCI defeats this: PTE updates flow through the Secure Kernel (VTL 1), which rejects attempts to
-make non-code pages executable. This is why HVCI-enabled targets require code-reuse attacks.
+make non-code pages executable. This is why HVCI-enabled targets (including all new 24H2 installs
+with compatible hardware) require code-reuse attacks.
 
 ```windbg
 ; Display PTE for a virtual address
@@ -799,35 +890,187 @@ dt nt!_SEP_TOKEN_PRIVILEGES <addr>
 
 ---
 
-## 9. Cross-Reference: Structures → Bug Classes
+## 9. Recent Developments (2024–2025)
 
-| Structure | Field(s) of Interest | Relevant Bug Class |
-|-----------|---------------------|-------------------|
-| `_EPROCESS` | `Token` (0x4b8, Win11) | Token theft, token pointer overwrite |
-| `_EPROCESS` | `ObjectTable` | Handle table corruption |
-| `_EPROCESS` | `ActiveProcessLinks` | DKOM process hiding (PatchGuard monitored) |
-| `_ETHREAD` | `ThreadToken` | Impersonation token injection |
-| `_TOKEN` | `Privileges.Present/Enabled` | Privilege escalation |
-| `_TOKEN` | `IntegrityLevel` | Integrity level bypass |
-| `_TOKEN` | `IsAppContainer`, `AppContainerSid` | AppContainer sandbox escape |
-| `_TOKEN` | `RestrictedSids[]`, `IsRestricted` | Restricted token bypass |
-| `_OBJECT_HEADER` | `TypeIndex` | Object type confusion (obfuscated in Win8+) |
-| `_POOL_HEADER` | `BlockSize`, `PoolType`, `PoolTag` | Pool overflow (classic pool) |
-| `_HANDLE_TABLE_ENTRY` | `GrantedAccessBits` | Handle access escalation via kernel write |
-| `_PTE` | NX bit (bit 63), U/S bit (bit 2) | PTE manipulation for shellcode exec |
-| `_MMVAD` | `VadFlags`, protection | Section object abuse, VAD tree confusion |
-| `_CONTROL_AREA` | Section metadata | Cross-process shared memory manipulation |
-| `_IRP` | `IoStatus`, `PendingReturned`, `Cancel` | IRP lifecycle bugs in drivers |
-| `_FILE_OBJECT` | `SecurityDescriptor` | File object ACL bypass |
-| `_SECURITY_DESCRIPTOR` | DACL pointer, MandatoryLabel | NULL DACL, DACL misconfiguration |
-| `_DRIVER_OBJECT` | `MajorFunction[]` | Dispatch table hook (DKOM-style attack) |
+### 9.1 VBS/VTL Changes — Windows 11 24H2 (Build 26100, October 2024)
+
+#### HVCI On By Default
+
+HVCI (Hypervisor-Protected Code Integrity) is now enabled by default on all new Windows 11 24H2
+installs with compatible hardware. This is the single most significant change for kernel exploit
+developers since the introduction of PatchGuard.
+
+**Hardware requirements for 24H2 HVCI:**
+- SLAT (Second Level Address Translation): Intel EPT or AMD RVI
+- IOMMU: Intel VT-d or AMD-Vi (required for DMA protection)
+- TPM 2.0
+- Secure Boot
+- MBEC (Mode-Based Execute Control) — required for the lower-overhead path
+
+**Performance overhead:**
+- With MBEC hardware support: approximately 2% overhead
+- Without MBEC (software emulation): 5–10% overhead
+
+**Impact on kernel exploit development:**
+
+A write primitive alone is no longer sufficient on HVCI-enabled systems. The classic exploit
+chain `arbitrary write → PTE flip to executable → shellcode execute` is blocked by the Secure
+Kernel in VTL 1, which intercepts PTE modification hypercalls and rejects changes that would
+make non-code pages executable.
+
+Required primitive upgrade: a code-reuse attack (ROP chain executing from existing kernel code)
+or a VTL 1 escape (targeting the Secure Kernel itself, a significantly higher bar).
+
+```windbg
+; Check HVCI / Code Integrity enforcement mode
+; 0x8 = HVCI enforced (VTL1 active)
+; 0x4 = KMCI (kernel mode code integrity, no VTL1 required)
+; 0x2 = IUM (Isolated User Mode / Credential Guard)
+dx @$ci = *(int*)&nt!g_CiOptions
+```
+
+#### Credential Guard On By Default (Domain-Joined)
+
+Credential Guard is now enabled by default on domain-joined systems in 24H2. The implementation
+runs `lsaiso.exe` as a TrustLet in VTL 1. NTLM hashes and Kerberos ticket-granting ticket (TGT)
+material are stored inside the VTL 1 enclave, inaccessible to VTL 0 kernel code.
+
+Consequence for credential dumping tools: LSASS memory read attacks (Mimikatz-style) against
+`lsass.exe` in VTL 0 will find that credential material has been replaced with opaque handles.
+The actual secrets live in `lsaiso.exe` in VTL 1.
+
+Check from kernel debug session:
+```windbg
+; lsaiso.exe TrustletIdentity will be non-zero
+!process 0 0 lsaiso.exe
+dt nt!_EPROCESS <addr> TrustletIdentity
+```
+
+#### securekernel.exe VTLCALL Interface Update
+
+The VTLCALL interface (the hypercall table between VTL 0 and the Secure Kernel) received new
+entries in 24H2 `securekernel.exe`. Notable addition: `SkmmVtlProtect`, which provides VTL 1
+managed memory protection services. Analysis of the updated VTLCALL table is a prerequisite for
+any VTL 1 escape research targeting 24H2.
+
+### 9.2 CVE-2024-21338 — EPROCESS Manipulation Case Study
+
+This CVE is the most significant public example of EPROCESS-based exploitation in 2024. It
+demonstrates the full attack chain from a built-in Windows driver vulnerability to EDR blindness.
+
+**Vulnerability:**
+- **Component:** `appid.sys` — the Windows AppLocker kernel driver, a built-in Windows component
+- **Class:** Arbitrary kernel read/write primitive via IOCTL handler vulnerability
+- **CVSS Score:** 7.8 (High)
+- **Patch:** February 2024 Patch Tuesday (KB5034763)
+- **CISA KEV:** Added to the Known Exploited Vulnerabilities catalog
+
+**Threat actor:** Lazarus Group (DPRK APT) — used in the FudModule v2 rootkit campaign.
+
+**Why `appid.sys` is notable:** Unlike BYOVD (Bring Your Own Vulnerable Driver) attacks that
+require installing a third-party driver, `appid.sys` is a built-in Windows driver. It is present
+on systems where AppLocker is configured — often the same enterprise security-hardened environments
+that have blocked third-party driver loading.
+
+**Full attack chain:**
+
+```
+1. Exploit CVE-2024-21338 in appid.sys IOCTL handler
+   → Obtain arbitrary kernel read/write primitive (VTL 0)
+
+2. Walk PsActiveProcessHead linked list
+   → Traverse EPROCESS.ActiveProcessLinks to enumerate all processes
+   → Locate target EPROCESS and SYSTEM EPROCESS structures
+
+3. Token stealing
+   → Read SYSTEM_EPROCESS.Token → get SYSTEM token address
+   → Write SYSTEM token address into target_EPROCESS.Token
+   → Target process now runs with SYSTEM privileges
+
+4. DKOM — Direct Kernel Object Manipulation
+   → Modify target_EPROCESS.ActiveProcessLinks
+   → Unlink process from doubly-linked list
+   → Process no longer appears in NtQuerySystemInformation(SystemProcessInformation)
+   → Hidden from Task Manager, Process Explorer, EDR process enumeration
+
+5. EDR callback nullification
+   → Locate and null out PsLoadImageNotifyRoutine[] array entries
+   → Locate and null out PsCreateProcessNotifyRoutine[] array entries
+   → EDR kernel callbacks are no longer invoked for image loads and process creation
+   → Kernel-level behavioral visibility of EDR products is severed
+```
+
+**Research significance:** Step 5 — nullifying `PsLoadImageNotifyRoutine` — is particularly
+impactful because most modern EDRs rely on these callbacks as the primary kernel telemetry channel.
+After nullification, the EDR's kernel driver continues running but receives no notifications for
+new processes or image loads. The attacker has achieved kernel-level stealth without directly
+attacking the EDR driver itself.
+
+**Reference:** https://decoded.avast.io/janvojtesek/lazarus-and-the-fudmodule-rootkit-beyond-byovd-with-an-admin-to-kernel-zero-day
+
+### 9.3 Vulnerable Driver Blocklist — Auto-Update (2024)
+
+The Microsoft Recommended Driver Block Rules list (`wdac_policy.xml`) was significantly expanded
+in 2024. The blocklist now ships via two channels:
+
+- **Windows Defender signature updates (daily):** The blocklist is embedded in Defender definition
+  updates, meaning new entries propagate within 24 hours to systems with real-time protection
+  enabled.
+- **Windows Update (monthly baseline):** The blocklist is also updated as part of the monthly
+  cumulative update, reaching systems that may have Defender disabled.
+
+**Practical impact for BYOVD research:**
+
+BYOVD (Bring Your Own Vulnerable Driver) techniques that rely on drivers from the public lists
+(e.g., drivers named in public CVEs, tools like LOLDrivers, or drivers previously used in public
+exploit chains) will fail on up-to-date Windows 11 24H2 systems. The kernel's driver load path
+checks the signature against the blocklist before allowing the driver to initialize.
+
+This does not eliminate BYOVD as a class — it raises the cost by requiring less-known vulnerable
+drivers. However, it significantly degrades the reliability of commodity BYOVD kits.
+
+**Current blocklist:** https://learn.microsoft.com/en-us/windows/security/application-security/application-control/app-control-for-business/design/microsoft-recommended-driver-block-rules
+
+---
+
+## 10. Cross-Reference: Structures → Bug Classes
+
+| Structure | Field(s) of Interest | Relevant Bug Class | Notable 2024 CVE |
+|-----------|---------------------|-------------------|--------------------|
+| `_EPROCESS` | `Token` (0x4b8, Win11) | Token theft, token pointer overwrite | CVE-2024-21338 (Lazarus/appid.sys) |
+| `_EPROCESS` | `ObjectTable` | Handle table corruption | — |
+| `_EPROCESS` | `ActiveProcessLinks` | DKOM process hiding (PatchGuard monitored) | CVE-2024-21338 (DKOM chain) |
+| `_EPROCESS` | `TrustletIdentity` (Build 26100) | VBS Enclave / TrustLet identification | — |
+| `_EPROCESS` | `SignatureLevel` / `SectionSignatureLevel` | Code integrity bypass per-process | — |
+| `_EPROCESS` | `MitigationFlagsOverride` | Per-process mitigation disable | — |
+| `_ETHREAD` | `ThreadToken` | Impersonation token injection | — |
+| `_ETHREAD` | `CetUserShadowStack` (Build 26100) | CET shadow stack redirect | Shadow stack attacks |
+| `_ETHREAD` | `ThreadLoggingEnabled` (Build 26100) | Per-thread EDR telemetry blind | — |
+| `_TOKEN` | `Privileges.Present/Enabled` | Privilege escalation | — |
+| `_TOKEN` | `IntegrityLevel` | Integrity level bypass | — |
+| `_TOKEN` | `IsAppContainer`, `AppContainerSid` | AppContainer sandbox escape | — |
+| `_TOKEN` | `RestrictedSids[]`, `IsRestricted` | Restricted token bypass | — |
+| `_OBJECT_HEADER` | `TypeIndex` | Object type confusion (obfuscated in Win8+) | — |
+| `_POOL_HEADER` | `BlockSize`, `PoolType`, `PoolTag` | Pool overflow (classic pool) | — |
+| `Segment Heap` | Free-list pointers (XOR-encoded, 2024) | Type confusion after infoleak | Heap-based type confusion |
+| `_HANDLE_TABLE_ENTRY` | `GrantedAccessBits` | Handle access escalation via kernel write | — |
+| `_PTE` | NX bit (bit 63), U/S bit (bit 2) | PTE manipulation — blocked by HVCI on 24H2 | — |
+| `_MMVAD` | `VadFlags`, protection | Section object abuse, VAD tree confusion | — |
+| `_CONTROL_AREA` | Section metadata | Cross-process shared memory manipulation | — |
+| `_IRP` | `IoStatus`, `PendingReturned`, `Cancel` | IRP lifecycle bugs in drivers | — |
+| `_FILE_OBJECT` | `SecurityDescriptor` | File object ACL bypass | — |
+| `_SECURITY_DESCRIPTOR` | DACL pointer, MandatoryLabel | NULL DACL, DACL misconfiguration | — |
+| `_DRIVER_OBJECT` | `MajorFunction[]` | Dispatch table hook (DKOM-style attack) | — |
+| `PsLoadImageNotifyRoutine[]` | Callback array | EDR callback nullification | CVE-2024-21338 (FudModule) |
+| `PsCreateProcessNotifyRoutine[]` | Callback array | EDR callback nullification | CVE-2024-21338 (FudModule) |
 
 ### Key Offsets (Windows 11 22H2 x64)
 
 > Always verify with `dt` in WinDbg — offsets change between builds.
+> For 24H2 (Build 26100), re-verify all offsets as new fields were added.
 
 ```c
-// EPROCESS
+// EPROCESS (Win11 22H2 baseline — verify for 24H2)
 EPROCESS.UniqueProcessId    = 0x440
 EPROCESS.ActiveProcessLinks = 0x448
 EPROCESS.Token              = 0x4b8   // EX_FAST_REF; mask with ~0xf for pointer
@@ -846,7 +1089,7 @@ OBJECT_HEADER.InfoMask      = 0x01A
 
 ---
 
-## 10. Essential WinDbg Commands — Foundational Research
+## 11. Essential WinDbg Commands — Foundational Research
 
 ```windbg
 ; === KERNEL BASE ===
@@ -869,6 +1112,9 @@ dt nt!_TOKEN <addr>                         ; full token structure
 !sd <sd_addr>                               ; security descriptor
 !acl <acl_addr>                             ; ACL entries
 !sid <sid_addr>                             ; SID string
+
+; === HVCI / CODE INTEGRITY (Build 26100) ===
+dx @$ci = *(int*)&nt!g_CiOptions           ; 0x8=HVCI, 0x4=KMCI, 0x2=IUM
 
 ; === MEMORY ===
 !vad                                        ; VAD tree for current process
@@ -900,6 +1146,10 @@ dps nt!KiServiceTable L nt!KiServiceLimit  ; dump system call table
 !irp <addr>                                 ; IRP state
 !devobj <addr>                              ; device object + pending IRPs
 
+; === EDR CALLBACK ARRAYS (CVE-2024-21338 research) ===
+dps nt!PsLoadImageNotifyRoutine L 8        ; image load callbacks (check for nulled entries)
+dps nt!PsCreateProcessNotifyRoutine L 8   ; process create callbacks
+
 ; === BATCH TOKEN DUMP ===
 !for_each_process "!token (poi(@$extret+0x4b8) & ~0xf)"
 ```
@@ -923,3 +1173,13 @@ dps nt!KiServiceTable L nt!KiServiceLimit  ; dump system call table
 [R-7] MSDN Win32 API Reference — https://learn.microsoft.com/en-us/windows/win32/api/
 
 [R-8] NT Native API Reference (community-maintained) — https://ntdoc.m417z.com/
+
+[R-9] *Lazarus and the FudModule Rootkit: Beyond BYOVD with an Admin-to-Kernel Zero-Day* — Jan Vojtěšek, Avast Threat Labs, February 2024 — https://decoded.avast.io/janvojtesek/lazarus-and-the-fudmodule-rootkit-beyond-byovd-with-an-admin-to-kernel-zero-day
+
+[R-10] *Microsoft Recommended Driver Block Rules* — Windows App Control for Business documentation — https://learn.microsoft.com/en-us/windows/security/application-security/application-control/app-control-for-business/design/microsoft-recommended-driver-block-rules
+
+[R-11] *Windows 11 24H2 VBS and HVCI Enforcement Changes* — Microsoft Security Blog — https://www.microsoft.com/en-us/security/blog/
+
+[R-12] *Virtualization-Based Security (VBS) Overview* — Microsoft Docs — https://learn.microsoft.com/en-us/windows-hardware/design/device-experiences/oem-vbs
+
+[R-13] LOLDrivers — Living Off The Land Drivers project (vulnerable and malicious driver catalog) — https://www.loldrivers.io/

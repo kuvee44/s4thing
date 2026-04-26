@@ -70,17 +70,19 @@ git clone https://github.com/googleprojectzero/sandbox-attacksurface-analysis-to
 ## Lab Progression
 
 ```
-Tier 1: Fundamentals        → WinDbg setup, ProcMon, token inspection
+Tier 1: Fundamentals        → WinDbg setup, ProcMon, token inspection (Labs 1–5)
     ↓
-Tier 2: Security Model      → Token manipulation, NtObjectManager, ACL analysis
+Tier 2: Security Model      → Token manipulation, NtObjectManager, ACL analysis (Labs 6–8)
     ↓
-Tier 3: Bug Class Repro     → PrintSpoofer, service tracing, junction + oplock
+Tier 3: Bug Class Repro     → PrintSpoofer, service tracing, junction + oplock,
+                               Task Scheduler RPC/AppContainer, Admin Protection bypass (Labs 9–15)
     ↓
-Tier 4: Kernel Exploitation → HEVD stack overflow, pool overflow, UAF
+Tier 4: Kernel Exploitation → HEVD stack overflow, pool overflow, ARM64 port,
+                               kernel callback analysis, WNF side-channel (Labs 16–20)
     ↓
-Tier 5: Patch Diffing       → BinDiff workflow, root cause analysis
+Tier 5: Patch Diffing       → BinDiff workflow, root cause analysis (Labs 21–23)
     ↓
-Tier 6: Variant Hunting     → COM enumeration, PrivescCheck + custom follow-up
+Tier 6: Variant Hunting     → COM enumeration, PrivescCheck + custom follow-up (Labs 24–27)
 ```
 
 ---
@@ -370,6 +372,8 @@ accesschk.exe -kd HKLM\SOFTWARE
 
 ## Tier 3 — Bug Class Reproduction (Labs 9–15)
 
+> Labs 9–13 cover foundational bug class reproduction. Labs 14–15 (added 2024–2025) cover CVE-2024-49039 style RPC/AppContainer boundary violations and the CVE-2025-21204 pattern for Administrator Protection bypass.
+
 ### Lab 9 — Reproduce PrintSpoofer
 
 **Objective:** Reproduce named pipe impersonation on Windows 10 (patched or unpatched — note which builds are vulnerable).
@@ -497,7 +501,92 @@ foreach ($pipe in $pipes) {
 
 ---
 
+### Lab 14 — Task Scheduler RPC from AppContainer (CVE-2024-49039 Style)
+
+**Tier:** 3 (Bug Class Reproduction)
+
+**Objective:** Understand how the Task Scheduler RPC interface is accessible from AppContainer processes and why this constitutes a security boundary violation.
+
+**Prerequisites:** Lab 9 (PrintSpoofer), understanding of AppContainer integrity level
+
+**Setup:** Windows 11 VM, RpcView installed, System Informer
+
+**Steps:**
+1. Create an AppContainer process using `CreateProcess` with `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES`:
+   ```c
+   // Initialize AppContainer SID
+   CreateAppContainerProfile(L"LabContainer", L"Lab AppContainer", L"", NULL, 0, &pSid);
+   // Set PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES in attribute list
+   // Launch cmd.exe or a custom probe binary inside the AppContainer
+   ```
+2. From the AppContainer process, enumerate accessible RPC interfaces via RpcView (attach to the AppContainer process and inspect active bindings)
+3. Identify `ITaskSchedulerService` interfaces accessible from Low IL — look for endpoints without proper security descriptor checks
+4. Call `SchRpcEnumTasks` from the AppContainer — verify it succeeds; this is the boundary violation
+5. Use `procmon` to trace what the scheduler does in response: filter on `svchost.exe` hosting `Schedule` service, watch for file/registry operations
+6. Document which RPC methods succeed vs. fail from AppContainer (create a table: method name, expected IL, actual result)
+
+**Expected outcome:** Student identifies the IL boundary crossing and understands RPC security descriptor analysis. The scheduler's RPC endpoints lack proper AppContainer checks, allowing methods to execute that should be blocked at Low IL.
+
+**Analysis extension:** Run the same test on a patched Windows 11 24H2 vs. an unpatched build — compare which `SchRpc*` methods are now blocked.
+
+**WinDbg command:**
+```windbg
+; Enumerate all RPC endpoints registered on the system
+!rpcexts.getendpointinfo
+
+; Find the scheduler endpoint specifically
+!rpcexts.getendpointinfo \pipe\atsvc
+```
+
+---
+
+### Lab 15 — Administrator Protection Bypass Analysis (CVE-2025-21204 Pattern)
+
+**Tier:** 3 (Bug Class Reproduction)
+
+**Objective:** Understand the Administrator Protection JIT token mechanism and how installer detection can be bypassed via junction redirection against `TiWorker.exe`.
+
+**Prerequisites:** Lab 8 (UAC bypass), understanding of token manipulation
+
+**Setup:** Windows 11 24H2 VM with Administrator Protection enabled via Group Policy
+
+**Steps:**
+1. Enable Administrator Protection:
+   ```
+   Computer Configuration → Windows Settings → Security Settings →
+   Local Policies → Security Options →
+   "User Account Control: Configure type of Admin Approval Mode" → Option 2
+   ```
+   Reboot to apply. Verify via `whoami /groups` — your admin token should show filtered.
+
+2. Observe `TiWorker.exe` behavior during a Windows Update: open `procmon` with filter `Process Name is TiWorker.exe`, capture File System events, then trigger Windows Update (Settings → Windows Update → Check for updates).
+
+3. Identify: `TiWorker.exe` creates files in `C:\Config.Msi` without verifying the path is not a junction. Note the exact file operations in the procmon trace (look for `CreateFile`, `WriteFile` to `C:\Config.Msi\*`).
+
+4. Create a junction from `C:\Config.Msi` to a controlled directory — timing is critical; the window is between when `C:\Config.Msi` is deleted and recreated:
+   ```cmd
+   :: Wait for TiWorker to delete C:\Config.Msi, then immediately:
+   mklink /J C:\Config.Msi C:\Users\<user>\AppData\Local\ControlledDir
+   ```
+
+5. Observe: `TiWorker.exe` writes files to your controlled directory instead of the intended location.
+
+6. (Read-only analysis) — use `NtObjectManager` to verify the written file's integrity level and owner:
+   ```powershell
+   Import-Module NtObjectManager
+   $file = Get-NtFile "C:\Users\<user>\AppData\Local\ControlledDir\<filename>"
+   Get-NtSecurityDescriptor $file | Select-Object Owner, IntegrityLevel
+   ```
+
+7. Document: what makes this a security boundary violation vs. a defense-in-depth weakening. Key distinction: Administrator Protection is an explicit security boundary — bypass requires a CVE; defense-in-depth weakening does not.
+
+**Expected outcome:** Student understands how a privileged writer can be redirected via junction, and why Administrator Protection specifically makes this a security boundary violation rather than a low-severity finding.
+
+---
+
 ## Tier 4 — Kernel Exploitation (Labs 16–20)
+
+> Labs 16–17 cover HEVD x64 exploitation. Labs 18–20 (added 2024–2025) cover ARM64 exploitation, kernel callback analysis (FudModule technique), and WNF-based information disclosure.
 
 ### Lab 16 — HEVD Setup and Stack Overflow
 
@@ -557,6 +646,149 @@ bp HEVD!TriggerStackOverflow
 5. Trigger: cause the corrupted object to be used → control flow hijack or arbitrary write
 
 **Key insight for Segment Heap (Windows 10 2004+):** The adjacent slot approach is harder — pool headers are separated from data. Focus on use-after-free scenarios or cross-cache attacks instead.
+
+---
+
+### Lab 18 — HEVD ARM64 Stack Overflow (ARM64 Windows)
+
+**Tier:** 4
+
+**Objective:** Port an x64 HEVD stack overflow exploit to ARM64, learning the key differences in calling convention, register layout, and ROP chain construction.
+
+**Prerequisites:** Labs 16–17 (HEVD x64 exploitation completed)
+
+**Setup:** Windows 11 ARM64 VM (available via MSDN subscription or Azure Arm64 VM), HEVD v3.x built for ARM64
+
+**Key differences from x64:**
+
+| Aspect | x64 | ARM64 |
+|--------|-----|-------|
+| Return address location | On stack (RSP+0) | Link Register (LR / X30) |
+| Stack canary | `__security_cookie` in stack frame | Varies; may use pointer auth (PAC) |
+| NX enforcement | DEP via NX bit | Same, but PAN/PAC may add constraints |
+| System call args | RCX, RDX, R8, R9, then stack | X0–X7, then stack |
+| ROP gadget density | High (x86 prefix reuse) | Lower (fixed-width 4-byte instructions) |
+
+**Steps:**
+1. Load HEVD ARM64 on the debuggee VM (test signing on, KDNET configured)
+2. Trigger the stack overflow IOCTL — confirm crash with PC control in WinDbg:
+   ```windbg
+   ; After BSOD, check:
+   r lr       ; Link Register — should contain your controlled value
+   r pc       ; Program Counter
+   ```
+3. Calculate offset to LR overwrite (different from x64 RIP offset)
+4. Build a ROP chain using ARM64 gadgets — use `rp++` or `ropper` targeting HEVD.sys and ntoskrnl:
+   ```
+   ropper --file ntoskrnl.exe --arch ARM64 --rop
+   ```
+5. Token-stealing shellcode must use ARM64 load/store instructions:
+   ```asm
+   ; ARM64 equivalent of token steal:
+   ; MRS X0, TPIDR_EL1   ; current KTHREAD (no GS segment on ARM64)
+   ; LDR X1, [X0, #KTHREAD_PROCESS_OFFSET]
+   ; ... walk ActiveProcessLinks ...
+   ```
+6. Verify SYSTEM shell after successful exploit
+
+**Learning outcome:** ARM64 calling convention, LR-based return control, ROP chain construction on fixed-width ISA, and HEVD exploitation across architectures.
+
+---
+
+### Lab 19 — Kernel Callback Enumeration and Nullification Analysis (Educational)
+
+**Tier:** 4 (read-only analysis — no exploitation)
+
+**Objective:** Understand how EDR kernel callbacks work using WinDbg, and analyze why FudModule's callback nullification was so effective against security products.
+
+**Prerequisites:** Labs 16–17, kernel debugging configured (KDNET)
+
+**Steps:**
+1. Attach kernel debugger to the Windows VM (or use a live kernel debug session)
+
+2. Inspect `_KPROCESS` structure to understand callback array layout:
+   ```windbg
+   dt nt!_KPROCESS
+   ```
+
+3. View all registered process creation notify callbacks:
+   ```windbg
+   dq nt!PspCreateProcessNotifyRoutine L10
+   ```
+   Each non-null entry is a callback registered by a driver (AV/EDR/OS component).
+
+4. Resolve each callback address to its owning module:
+   ```windbg
+   ; For each non-null entry, strip the low 4 bits (encoded pointer) and look up symbol:
+   ln <decoded_address>
+   lm a <decoded_address>
+   ```
+
+5. Repeat for thread and image load callbacks:
+   ```windbg
+   dq nt!PspCreateThreadNotifyRoutine L10
+   dq nt!PspLoadImageNotifyRoutine L10
+   ```
+
+6. Document which callbacks belong to which security products in your VM (list: driver name, callback type, registered address).
+
+7. Inspect `PsSetCreateProcessNotifyRoutine` — does Windows validate the integrity of callback table entries at registration time? At invocation time? Analyze: what prevents an attacker with arbitrary kernel write from zeroing these entries?
+   ```windbg
+   ; Check if there is a guard around the callback array:
+   !analyze -v    ; look for PatchGuard coverage of callback arrays
+   ```
+
+**Expected outcome:** Student understands the exact mechanism FudModule exploited — no code execution is needed in security product processes once their kernel callbacks are zeroed. The analysis also reveals the current state of PatchGuard coverage for callback arrays.
+
+---
+
+### Lab 20 — WNF State as Information Disclosure Side-Channel
+
+**Tier:** 4
+
+**Objective:** Enumerate Windows Notification Facility (WNF) states, subscribe to security-sensitive state changes, and identify states that expose information beyond the subscriber's integrity level.
+
+**Setup:** Windows 11 VM, WinDbg, NtObjectManager PowerShell module
+
+**Background:** WNF (Windows Notification Facility) is a publish/subscribe kernel mechanism used throughout Windows for state change notification. Some WNF states carry security-sensitive data and may be readable or subscribable from integrity levels that should not have access — a potential information disclosure primitive.
+
+**Steps:**
+1. Enumerate all predefined WNF states:
+   ```powershell
+   Import-Module NtObjectManager
+   Get-NtWnfStateName -Predefined | Sort-Object Name | Format-Table Name, DataScope, PermanentData
+   ```
+
+2. Subscribe to security-sensitive WNF states and observe when they fire:
+   ```powershell
+   # Example: logon session state changes
+   $sub = Register-NtWnfStateSubscription -StateName "WNF_LSAS_LOGON_SESSION_STATE" -Script {
+       param($StateName, $Data, $Subscription)
+       Write-Host "WNF fired: $StateName, Data length: $($Data.Length)"
+   }
+
+   # Trigger a logon event (lock/unlock screen) and observe
+   ```
+
+3. Correlate WNF state change timestamps with security events in the Event Log:
+   ```powershell
+   Get-WinEvent -LogName Security -MaxEvents 50 | Where-Object { $_.Id -in @(4624, 4634, 4647) }
+   ```
+
+4. Inspect WNF state data in WinDbg:
+   ```windbg
+   ; List all subscribed WNF states for a process
+   !wnf <pid>
+
+   ; Read raw WNF state data
+   !wnf -s <wnf_state_name_value>
+   ```
+
+5. Identify: which WNF states provide state changes observable from Medium or Low IL that reveal information about High IL or SYSTEM operations? Candidates include logon session state, token change events, and UAC elevation events.
+
+6. Document: for each identified state — subscriber IL required, data exposed, potential information disclosure classification (IOCD vs. full security boundary violation).
+
+**Expected outcome:** Student understands WNF as a kernel pub/sub mechanism, can enumerate and subscribe to states, and can identify states where cross-IL information leakage is possible — a class of vulnerability that has appeared in multiple MSRC advisories.
 
 ---
 

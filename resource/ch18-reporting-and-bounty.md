@@ -21,6 +21,37 @@ MSRC uses this document to determine if a reported issue qualifies as a security
 | Sandbox → Host | AppContainer / Low IL should not escape | Chrome renderer (Low IL) → medium IL or higher |
 | Hyper-V → Host | Guest VM should not access host or other VMs | Hyper-V guest escape |
 
+### 2024-2025 Updates to Security Boundaries
+
+**VTL (Virtual Trust Level) — now a defended security boundary (Windows 11 24H2):**
+
+Starting with Windows 11 24H2, MSRC formally treats VTL transitions as a security boundary. A bug that allows VTL0 code to influence VTL1 (Isolated User Mode / VSM) state is a qualifying vulnerability. Previously this area was considered "best-effort hardening"; it is now explicitly in scope.
+
+- VTL0 → VTL1 escalation: treated as Critical (comparable to Hyper-V guest escape)
+- Kernel (VTL0) → Hypervisor / VTL2: new boundary — see "Kernel to hypervisor" below
+
+**AppContainer escape — consistent severity rating (2024 update):**
+
+MSRC now consistently rates AppContainer escapes as **Important** or **Critical** depending on the target and context:
+- AppContainer → Medium IL (standard user context): **Important**
+- AppContainer → High IL / SYSTEM / another sandboxed process with elevated capability: **Critical**
+- AppContainer escape in the context of Microsoft Edge renderer → host: **Critical** (treated as browser sandbox escape)
+
+This is a tightening from prior practice where some AppContainer escapes were rated Moderate if the resulting access was viewed as limited.
+
+**Administrator Protection bypass — new boundary added (Windows 11 24H2):**
+
+Windows 11 24H2 introduced "Administrator Protection," a JIT token isolation mechanism where administrator accounts run with a standard token by default and a separate, isolated admin token is issued only on demand (replacing the traditional UAC split-token model). MSRC now treats bypassing Administrator Protection as a qualifying security vulnerability:
+
+- Bypassing Administrator Protection to obtain the admin token without explicit user consent: **Important**
+- This replaces the old "UAC bypass" category which was historically not a security boundary — under the new model, Administrator Protection bypasses **are** in scope
+
+**Kernel to hypervisor — new boundary (Hyper-V VTL escape):**
+
+Escaping from the Windows kernel (VTL0, ring 0) to the hypervisor layer is now explicitly recognized as a security boundary violation:
+- Kernel-mode code achieving hypervisor-level execution or influencing hypervisor state: **Critical**
+- This boundary is relevant for research into Hyper-V hypercall interfaces, MSR handling, and VMCS manipulation from guest kernel context
+
 ### What Is NOT a Security Boundary
 
 | Scenario | Why Not Defended |
@@ -76,6 +107,34 @@ Some bugs get a CVE but don't cross a defined security boundary. These are "defe
 | Hyper-V escape | Up to $250,000 |
 | Security feature bypass | Up to $30,000 |
 
+### 2024 MSRC Portal and Bug Bar Updates
+
+**Proof of Concept quality requirements (2024):**
+
+MSRC tightened PoC requirements in 2024. A submission is now expected to include:
+- A PoC that compiles and runs without modification on a standard Windows build
+- Clear "success condition" output (e.g., spawning `cmd.exe` as SYSTEM, printing token privileges, writing to a protected path)
+- If the bug requires specific build/update level: document which cumulative update was installed (`Get-HotFix | Sort-Object -Descending | Select-Object -First 5`)
+- Video recording of PoC execution is now accepted and encouraged for timing-sensitive bugs
+
+Submissions with only theoretical analysis or pseudocode PoC are routed to a lower-priority queue and may be closed after 30 days without researcher response to a PoC request.
+
+**Bug bar 2024 — EoP vs. Security Feature Bypass distinction:**
+
+MSRC sharpened the boundary between "Elevation of Privilege" and "Security Feature Bypass" in their 2024 bug bar update:
+
+- **EoP**: The attacker gains a privilege token or integrity level they should not have. Impact is direct code execution or resource access at higher privilege.
+- **Security Feature Bypass (SFB)**: A security mitigation is circumvented, but direct privilege gain requires a second bug. Example: bypassing KCFG without gaining a kernel write primitive.
+
+Researchers who claim EoP when the bug is actually an SFB will have their submission downgraded. Make the distinction explicit in your report.
+
+**Researcher Recognition program — 2024 updates:**
+
+- MSRC's "Most Valuable Security Researcher" (MVSR) program was restructured in 2024
+- Points are now tracked per-calendar-year for ranking; top researchers receive BlueHat invitation priority
+- New "Researcher Spotlight" posts: MSRC now publishes quarterly posts highlighting individual researchers by name (with their consent)
+- Recognition is now explicitly tied to report quality metrics, not only CVE count — high-quality reports with detailed root cause analysis receive higher point weighting
+
 ---
 
 ## 3. Zero Day Initiative (ZDI) as an Alternative
@@ -93,6 +152,45 @@ ZDI purchases vulnerabilities from researchers and coordinates disclosure with t
 | New researcher | ZDI may be more approachable | MSRC handles all submissions |
 
 **ZDI timeline:** 120-day disclosure window (vs. Project Zero's 90-day standard).
+
+### ZDI 2024 Updates
+
+**Updated payout ranges (2024):**
+
+ZDI published revised payout ranges in 2024 reflecting the increased weaponization value of certain bug classes:
+
+| Bug Class | 2024 ZDI Payout Range |
+|-----------|----------------------|
+| Windows kernel UAF (reliable, weaponizable) | $200,000 – $400,000 |
+| Windows kernel OOB write | $100,000 – $200,000 |
+| Windows kernel info leak (standalone) | $10,000 – $30,000 |
+| Hyper-V guest escape | Up to $400,000 |
+| AppContainer escape (browser context) | $50,000 – $150,000 |
+| Windows LPE (non-kernel, service-level) | $10,000 – $50,000 |
+
+These are ranges, not guarantees. Final payout depends on exploitation reliability, completeness of PoC, and whether the bug is pre-patch or already known.
+
+**CVE-2024-49039 (Task Scheduler) — ZDI acquisition example:**
+
+CVE-2024-49039 was a Windows Task Scheduler LPE (EoP via AppContainer escape allowing execution at Medium integrity) that ZDI acquired and publicly disclosed after the November 2024 Patch Tuesday. Key notes:
+- ZDI classified it as a "low-to-medium IL AppContainer boundary violation"
+- The bug was notable because it was exploited in the wild by APT groups before the patch
+- ZDI's handling: withheld PoC until patch, then published full advisory with researcher credit
+- This is an example of ZDI's "Exploited in the Wild" handling process
+
+**ZDI "Exploited in the Wild" bonus:**
+
+ZDI introduced a bonus payment category for bugs discovered pre-exploitation (i.e., the researcher found it before threat actors):
+- Bonus applies if ZDI can verify through threat intelligence that the bug was not known to be exploited at the time of researcher submission
+- Bonus: approximately 25–50% above base payout
+- Requires researcher to provide evidence of independent discovery (submission timestamp, private communication history)
+
+**120-day deadline — stricter enforcement in 2024:**
+
+ZDI published a policy update in 2024: the 120-day deadline is now more strictly enforced with fewer extensions. Previously, vendor requests for extension were routinely granted; in 2024, ZDI requires documented progress toward a fix to grant extensions beyond 120 days. After 120 days with no patch:
+1. ZDI publishes a "0-day advisory" with limited technical details
+2. Full details released after an additional 30-day grace period
+3. No further extension regardless of vendor patch timeline
 
 ---
 
@@ -322,6 +420,67 @@ AV:N / AC:L / PR:N / UI:N / S:U / C:H / I:H / A:H
 Score: 9.8 CRITICAL
 ```
 
+### CVSS 4.0 — Released 2023, Mainstream in 2024
+
+CVSS 4.0 was formally released by FIRST in October 2023 and became widely referenced throughout 2024. **MSRC still scores internally using CVSS 3.1**, but CVSS 4.0 is increasingly used in academic research, ZDI advisories, and NVD entries. Researchers should understand both systems.
+
+**Key structural changes in CVSS 4.0:**
+
+CVSS 4.0 replaces the single "Base Score" with a multi-level nomenclature:
+- `CVSS-B` — Base score only
+- `CVSS-BE` — Base + Environmental
+- `CVSS-BT` — Base + Threat (replaces Temporal)
+- `CVSS-BTE` — All three combined
+
+**New metric groups in CVSS 4.0:**
+
+*Supplemental Metrics (informational, do not affect score):*
+- `Safety (S)`: Potential for physical harm (Not Defined / Negligible / Present)
+- `Automatable (A)`: Can the attack be scripted/automated without human involvement?
+- `Recovery (R)`: Can the system recover automatically after exploitation?
+- `Value Density (V)`: Sparse (single target value) vs. Diffuse (mass target value)
+
+*Base Metric changes:*
+- `Attack Requirements (AT)` is a new metric replacing part of what `Attack Complexity (AC)` covered in v3.1:
+  - `AT:N` (None) — no special conditions required
+  - `AT:P` (Present) — specific target configuration or state required
+- `AC` in 4.0 is narrower: focuses only on whether the attacker needs additional effort beyond the defined attack vector
+- Scope (`S`) from v3.1 is replaced by separate `Vulnerable System` and `Subsequent System` impact metrics
+
+**CVSS 4.0 scoring for a standard Windows LPE:**
+
+```
+CVSS:4.0/AV:L/AC:L/AT:N/PR:L/UI:N/VC:H/VI:H/VA:H/SC:H/SI:H/SA:H
+```
+
+| Metric | Value | Notes |
+|--------|-------|-------|
+| AV (Attack Vector) | L (Local) | Same as v3.1 |
+| AC (Attack Complexity) | L (Low) | Narrower definition in 4.0 |
+| AT (Attack Requirements) | N (None) | No special target precondition |
+| PR (Privileges Required) | L (Low) | Standard user |
+| UI (User Interaction) | N (None) | No interaction needed |
+| VC (Vulnerable System Confidentiality) | H | High impact on exploited system |
+| VI (Vulnerable System Integrity) | H | High impact on exploited system |
+| VA (Vulnerable System Availability) | H | High impact on exploited system |
+| SC (Subsequent System Confidentiality) | H | Impact propagates to subsequent systems |
+| SI (Subsequent System Integrity) | H | SYSTEM access allows lateral impact |
+| SA (Subsequent System Availability) | H | Full subsequent system impact |
+
+**Comparison table: same LPE bug in CVSS 3.1 vs. CVSS 4.0:**
+
+| Aspect | CVSS 3.1 | CVSS 4.0 |
+|--------|----------|----------|
+| Vector string | `AV:L/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H` | `AV:L/AC:L/AT:N/PR:L/UI:N/VC:H/VI:H/VA:H/SC:H/SI:H/SA:H` |
+| Base Score | 7.8 HIGH | ~8.5 HIGH (differs due to SC/SI/SA metrics) |
+| Scope concept | Single S metric (U/C) | Separate VC/VI/VA + SC/SI/SA |
+| Race condition handling | `AC:H` | `AC:H` + optionally `AT:P` |
+| Supplemental info | None | Safety, Automatable, Recovery, Value Density |
+| MSRC internal use | Yes | No (still uses 3.1) |
+| NVD / ZDI (2024+) | Common | Increasingly used |
+
+**Practical recommendation:** Submit with CVSS 3.1 to MSRC (as required). Include CVSS 4.0 in your public writeup for completeness and to align with 2024+ NVD practice.
+
 ---
 
 ## 6. Coordinated Disclosure Best Practices
@@ -375,6 +534,23 @@ If you have evidence a bug you've reported is actively exploited:
 | **Low** | Difficult to exploit, minimal impact | DoS with limited scope, non-sensitive info disclosure |
 
 **For LPE research:** Most qualifying Windows LPE bugs land at **Important** (7.0–7.8 CVSS). To reach **Critical**, a LPE would need to be wormable (reachable from network without auth) or affect a very large-scale sandboxed context.
+
+### 2024-2025 Severity Rating Updates
+
+The following boundary-specific severity assignments reflect MSRC practice updated in 2024:
+
+| Bug Class | 2024 Severity Rating | Notes |
+|-----------|---------------------|-------|
+| Administrator Protection bypass | **Important** | Previously UAC bypass was "Moderate" or non-qualifying; new model treats this as Important |
+| VTL (VTL0 → VTL1) escape | **Critical** | New boundary; comparable to Hyper-V guest escape |
+| Kernel to hypervisor (VTL0 ring-0 → hypervisor) | **Critical** | New boundary in 24H2 era |
+| PPL (Protected Process Light) bypass | **Important** | Unchanged from prior practice |
+| AppContainer escape → Medium IL | **Important** | Consistent rating (previously varied case-by-case) |
+| AppContainer escape → High IL / SYSTEM (browser context) | **Critical** | Context-dependent; browser renderer → host = Critical |
+| Standard kernel LPE (ring-3 → ring-0 with SYSTEM) | **Important** | Typical 7.8 CVSS range |
+| Hyper-V guest escape | **Critical** | Unchanged; up to $250K bounty |
+
+**Key change: Administrator Protection bypass replaces "UAC bypass" as a meaningful category.** Under the old model, UAC bypasses (which only work if the user is already in the Administrators group with split-token) were officially "not a security boundary" and received no bounty. Under Administrator Protection (24H2+), the mechanism is fundamentally different — bypass now means obtaining a JIT-issued admin token without user consent, which crosses the new security boundary. If you are targeting 24H2 systems, Administrator Protection bypass is in scope.
 
 ---
 
@@ -619,6 +795,127 @@ your-cve-repo/
 
 ---
 
+## 18.10 Microsoft Bounty Program 2024 Updates
+
+MSRC restructured and updated bounty payout ranges in 2024, reflecting the increased value placed on certain attack categories and newly introduced security boundaries.
+
+### Updated Payout Ranges (2024)
+
+| Vulnerability Category | 2024 Payout Range | Notes |
+|------------------------|-------------------|-------|
+| Kernel EoP with weaponizable primitive (reliable SYSTEM) | $30,000 – $100,000 | Requires full exploitation chain, not just read/write primitive |
+| Critical kernel 0-day (in-wild-quality exploit) | $100,000 – $250,000 | PoC must demonstrate in-wild-level reliability; effectively a complete weapon |
+| VBS/VTL escape (VTL0 → VTL1) | $50,000 – $150,000 | New category introduced 2024 alongside VTL as defended boundary |
+| Administrator Protection bypass | $10,000 – $50,000 | New category introduced 2024; replaces non-qualifying UAC bypass class |
+| Hyper-V guest escape | Up to $250,000 | Unchanged; remains highest-value category |
+| AppContainer escape (standard context) | $10,000 – $30,000 | Context-dependent; browser context may qualify for higher range |
+| AppContainer escape (browser renderer) | $30,000 – $100,000 | Treated as Critical sandbox escape |
+| Windows RCE (network, no auth) | Up to $100,000+ | Varies by component and exploitability |
+| Security Feature Bypass (standalone) | $5,000 – $30,000 | Requires documented security impact beyond bypassing detection |
+
+All payouts require submission through the MSRC portal and are subject to MSRC's final severity determination. Payout is issued after the patch ships, not at submission.
+
+**Verify current ranges at:** https://www.microsoft.com/en-us/msrc/bounty
+
+### "High Impact Scenarios" Bonus Program
+
+MSRC introduced a bonus program for researchers who demonstrate chained exploits that achieve significantly higher impact than a single bug would warrant:
+
+- **Chain bonus:** If you submit two or more bugs that together achieve a higher-severity impact than either bug alone, MSRC may award an additional bonus of up to 50% above the individual payout
+- **Example qualifying chain:** AppContainer escape (Important) + kernel LPE (Important) = combined Critical impact chain → bonus on top of both individual awards
+- **Documentation requirement:** You must explicitly document the chain in your submission, showing each step and the combined impact. MSRC will not infer the chain — present it as a complete end-to-end scenario.
+
+### Submission Quality Bonus (2024)
+
+MSRC introduced a submission quality bonus in 2024:
+- A detailed, well-written report with full root cause analysis, clear reproduction steps, and CVSS justification can receive a **25% bonus** on top of the standard payout
+- Criteria evaluated: completeness of root cause explanation, accuracy of CVSS self-assessment, quality of PoC code (commented, minimal, reliable), and response speed to follow-up questions
+- The bonus is discretionary and assigned by the MSRC engineer reviewing the case; it is not guaranteed but is achievable with consistent report quality
+
+### Bounty vs. Acknowledgment-Only
+
+Not all qualifying bugs receive bounty:
+- Bugs that fall below a payout threshold (typically Low/Moderate severity) receive CVE acknowledgment only
+- Defense-in-depth fixes receive no CVE and no bounty
+- "Not reproducible" or "by design" outcomes receive nothing
+
+Tracking your submissions in a private spreadsheet (submission date, case ID, severity outcome, payout amount, patch date) is strongly recommended for both financial planning and demonstrating research productivity.
+
+---
+
+## 18.11 In-the-Wild Exploit Reporting Process
+
+When you discover a vulnerability that is already being exploited by threat actors — rather than a novel research finding — the handling process is fundamentally different. This section covers what to do if you observe an exploit in active use by APTs or criminal actors before you have reported it.
+
+### Why This Situation Arises
+
+Researchers encounter in-the-wild (ITW) exploits through:
+- Malware analysis (extracting exploit code from a malware sample)
+- Incident response (finding exploitation artifacts on a compromised system)
+- Threat intelligence work (receiving a sample from a collaborating researcher)
+- Independent discovery that coincides with observed APT activity (you found the same bug they are using)
+
+### Step-by-Step Process
+
+**1. Urgency — notify MSRC within 24 hours**
+
+For an exploit actively being used against real targets, the standard 90-day timeline does not apply. You are now operating in emergency disclosure mode:
+
+- Use the MSRC portal's "actively exploited" checkbox when submitting
+- If you have a direct MSRC contact from prior work, email them directly with subject line: `[URGENT] Active Exploitation — [Component] — [Brief Description]`
+- If you do not have a direct contact, use the portal and mark the case as urgent in the description
+
+**2. Include in your submission**
+
+- IOCs (Indicators of Compromise): file hashes, network indicators, memory signatures if available
+- Sample hashes (SHA-256) of any malware samples that contain or trigger the exploit — do not attach actual malware binaries to the submission portal; reference them by hash
+- Affected Windows builds confirmed vulnerable
+- Attribution context if available: "This exploit was observed in samples attributed to [threat cluster] targeting [sector/region]" — even rough attribution helps MSRC prioritize
+- Your discovery source and timeline: how you found out the bug was being exploited and when
+
+**3. MSRC emergency response process**
+
+When MSRC confirms active exploitation, their SLA changes:
+- Standard target: <7 day initial response (vs. the normal 24–72 hour acknowledgment + 2-week assessment)
+- MSRC may contact the Windows servicing team immediately to begin patch development in parallel with triage
+- MSRC will coordinate with Microsoft Threat Intelligence Center (MSTIC) to cross-reference the ITW activity
+- Out-of-band patch is possible: Microsoft has shipped emergency patches outside the monthly Patch Tuesday cycle for actively exploited bugs (e.g., MS17-010 for EternalBlue)
+
+**4. Your rights during emergency disclosure**
+
+- **Credit in advisory is standard:** You will receive acknowledgment in the CVE advisory. MSRC typically credits the researcher who reported the ITW activity separately from any researcher who originally found the bug class.
+- **Coordinate on public disclosure timing:** MSRC will ask you to hold technical details until the patch is released. For ITW bugs, this is reasonable — technical publication before a patch benefits threat actors more than defenders.
+- **You are not obligated to hold forever:** If MSRC fails to patch within a reasonable timeframe (60–90 days even for ITW bugs), you retain the right to disclose. ITW exploitation is public harm; indefinite silence does not serve defenders.
+
+**5. CISA notification — when required**
+
+If the bug is being used to target US government systems or critical infrastructure:
+- CISA expects notification via their vulnerability reporting portal: https://www.cisa.gov/report
+- CISA coordinates with MSRC and may issue emergency directives to federal agencies (as they did for CVE-2021-40444, ProxyLogon, and similar critical ITW bugs)
+- If you have information about specific government or critical infrastructure targets, CISA notification is expected in addition to MSRC notification, not instead of it
+
+### Case Study: CVE-2024-21338 — AhnLab → MSRC → Patch Tuesday
+
+CVE-2024-21338 is a Windows kernel elevation of privilege vulnerability in the `appid.sys` driver (Windows Application Identity service). It was used by the Lazarus Group (North Korean state-sponsored APT) to bypass kernel-level Endpoint Detection and Response (EDR) solutions by achieving a read/write primitive that allowed them to manipulate kernel data structures used by EDR drivers.
+
+**Discovery and handling timeline:**
+1. **AhnLab ASEC** (South Korean security firm) identified the exploit during incident response on a compromised target
+2. AhnLab reported to MSRC with active exploitation evidence, including behavioral IOCs and the exploit mechanism
+3. MSRC classified the bug as actively exploited and prioritized it for the February 2024 Patch Tuesday cycle
+4. **February 2024 Patch Tuesday** shipped a fix for CVE-2024-21338 as part of the monthly update
+5. After the patch, AhnLab published a public technical writeup with full exploitation analysis
+
+**What this case illustrates:**
+- The ITW reporting process works as intended when the reporting organization has full exploitation evidence
+- MSRC can move a bug through the patch cycle in approximately 6–8 weeks when exploitation is confirmed
+- Post-patch publication by the discovering organization is the correct timeline — technical details were held until the patch was live
+- The bug demonstrated a technique (using a signed driver's IOCTL interface to achieve a kernel primitive) that was subsequently studied by the broader research community — the public writeup had research value after the patch
+
+**What CVE-2024-21338 was technically:**
+The `appid.sys` driver exposed an IOCTL interface that did not properly validate attacker-controlled input, allowing a user-mode process to achieve a kernel arbitrary read/write primitive. Lazarus used this to manipulate kernel callback structures used by EDR products, effectively disabling their monitoring while maintaining a stable kernel foothold. This is a pattern (signed-driver IOCTL abuse for kernel primitive) that researchers studying Windows EDR bypass techniques should study carefully.
+
+---
+
 ## References
 
 - [R-1] MSRC Submission Portal — Microsoft — https://msrc.microsoft.com/report/vulnerability
@@ -631,3 +928,10 @@ your-cve-repo/
 - [R-8] MSRC Severity Classification — Microsoft — https://msrc.microsoft.com/blog/2022/05/microsoft-vulnerability-severity-classification/
 - [R-9] NVD CVE Search — NIST — https://nvd.nist.gov/vuln/search
 - [R-10] SpecterOps ADCS Research (ESC1-ESC8) — Will Schroeder / Andy Robbins — https://posts.specterops.io/certified-pre-owned-d95910965cd2
+- [R-11] CVSS 4.0 Specification — FIRST — https://www.first.org/cvss/v4-0/
+- [R-12] CVSS 4.0 Calculator — FIRST — https://www.first.org/cvss/calculator/4.0
+- [R-13] CVE-2024-21338 Advisory — Microsoft — https://msrc.microsoft.com/update-guide/vulnerability/CVE-2024-21338
+- [R-14] CVE-2024-49039 Advisory — Microsoft — https://msrc.microsoft.com/update-guide/vulnerability/CVE-2024-49039
+- [R-15] CISA Vulnerability Reporting — CISA — https://www.cisa.gov/report
+- [R-16] ZDI Disclosure Policy — Trend Micro ZDI — https://www.zerodayinitiative.com/advisories/disclosure_policy/
+- [R-17] AhnLab CVE-2024-21338 Analysis — AhnLab ASEC — https://asec.ahnlab.com/en/63353/

@@ -350,6 +350,127 @@ used in their own vulnerability research. The `codeql/cpp-queries` pack contains
 Study these queries before writing your own — they demonstrate correct CodeQL idiom
 for common vulnerability classes.
 
+### 12.3.5 CodeQL 2024 Updates and Migration Notes
+
+**Improved C++ query performance (2024)**
+
+CodeQL 2024 releases introduced significant performance improvements for large C++
+codebases. Key changes relevant to Windows research:
+- Incremental database builds: re-run only on changed translation units (useful for
+  tracking Windows Insider builds)
+- Improved `DataFlow::Configuration` API replaced by the new `DataFlow::Module` approach
+  in CodeQL v2.15+; older query syntax still works but shows deprecation warnings
+
+**LGTM shutdown — migration to GitHub Code Scanning**
+
+LGTM.com was shut down in **March 2024**. All analysis now happens via:
+- GitHub Code Scanning (for repositories hosted on GitHub)
+- CodeQL CLI (local / CI analysis, recommended for closed-source work)
+- VS Code CodeQL extension for interactive query development
+
+For Windows research against proprietary binaries and driver source obtained via
+bug bounty / partner programs, the CLI workflow is the only viable option:
+
+```bash
+# Recommended local workflow post-LGTM
+codeql database create win_driver_db \
+    --language=cpp \
+    --command="msbuild /t:Build /p:Configuration=Release driver.sln" \
+    --source-root=C:\driver_source\
+
+# Analyze with a query suite
+codeql database analyze win_driver_db \
+    codeql/cpp-queries:Security/ \
+    --format=sarif-latest \
+    --output=results.sarif
+```
+
+**CodeQL for Win32k syscall filtering — `NtUserGetMessage` variant class**
+
+The Win32k syscall allow-list (introduced as a sandbox mitigation) creates an
+interesting variant class: any Win32k syscall reachable from low-IL processes that
+is not on the allow-list but still executes represents an incomplete filter.
+A CodeQL query to enumerate such candidates against the Win32k source:
+
+```ql
+import cpp
+
+// Find Win32k kernel entry stubs that are NOT in the syscall filter table
+// (requires Win32k source or partially-reversed symbols)
+
+class Win32kSyscallStub extends Function {
+    Win32kSyscallStub() {
+        // Win32k user-mode entry stubs share a naming convention
+        this.getName().matches("NtUser%") or
+        this.getName().matches("NtGdi%")
+    }
+}
+
+class SyscallFilterEntry extends StringLiteral {
+    SyscallFilterEntry() {
+        // The filter table is typically an array of string constants
+        // or an enum; adapt to actual implementation
+        this.getParent*().(ArrayAggregateLiteral).getType().getName() = "SYSCALL_FILTER_ENTRY"
+    }
+}
+
+from Win32kSyscallStub stub
+where
+    // Stub is not referenced in the filter table
+    not exists(SyscallFilterEntry entry |
+        entry.getValue() = stub.getName()
+    )
+select stub, "Win32k syscall stub potentially absent from filter table: " + stub.getName()
+```
+
+**MSRC open-sourced CodeQL queries (2024)**
+
+In 2024, MSRC published a set of CodeQL queries used internally for Windows driver
+vulnerability research. These are available in the
+`microsoft/Windows-Driver-Developer-Supplemental-Tools` repository on GitHub.
+Key queries to study:
+- `DriverPortability/` — driver compatibility checks
+- `Likely Bugs/Memory Management/` — pool allocation patterns without size validation
+- `Likely Bugs/UninitializedPtrField/` — uninitialized pointer fields in kernel structs
+
+```bash
+# Clone and use MSRC's driver query pack
+git clone https://github.com/microsoft/Windows-Driver-Developer-Supplemental-Tools
+cd Windows-Driver-Developer-Supplemental-Tools
+
+# Run the Windows driver security queries against your database
+codeql database analyze win_driver_db \
+    windows-driver-developer-supplemental-tools/codeql/windows-drivers/queries/ \
+    --format=sarif-latest \
+    --output=driver_results.sarif
+```
+
+**CodeQL database creation for Windows kernel drivers (cross-compile workflow)**
+
+Building a CodeQL database for a Windows kernel driver from a Linux/WSL2 host requires
+a cross-compilation harness. The key challenge: `codeql database create` must intercept
+the actual compiler invocations to extract compilation units.
+
+```bash
+# On WSL2 — cross-compile workflow using MSVC via wine or a build VM
+# Option 1: Build inside a Windows VM, extract the DB, analyze on Linux
+#   (codeql databases are platform-independent after creation)
+
+# Option 2: Use the CodeQL "indirect build tracer" for MSVC
+# Set CodeQL trace environment before invoking msbuild
+export CODEQL_EXTRACTOR_CPP_TRAP_DIR=/tmp/codeql_traps
+export CODEQL_EXTRACTOR_CPP_SOURCE_ARCHIVE_DIR=/tmp/codeql_src
+
+# Then run the build inside a Windows environment with CodeQL tracing active:
+# %CODEQL_HOME%\tools\win64\trace\codeql-win64.exe msbuild driver.sln
+
+# After build completes, finalize the database
+codeql database finalize win_driver_db
+
+# Practical tip: use GitHub Actions with a Windows runner for automated
+# driver database creation as part of CI
+```
+
 ---
 
 ## 12.4 Semgrep Rules for Windows C/C++ Patterns
@@ -500,6 +621,167 @@ jackalope.exe \
 Jackalope will mutate these to explore new code paths. Include inputs for each known
 IOCTL code to maximize coverage from the start.
 
+### 12.5.3 Jackalope/TinyInst 2024 Updates — Windows 11 Compatibility
+
+TinyInst received several significant updates through 2024 to improve Windows 11
+compatibility:
+
+- **ARM64 support**: TinyInst now supports coverage instrumentation on Windows ARM64,
+  enabling fuzzing on Surface Pro X / ARM64 devices where some driver attack surface
+  differs from x64
+- **Windows 11 22H2/23H2 compatibility fixes**: Several issues with module loading
+  order and instrumentation of modules loaded via the new loader path in 22H2 were
+  resolved
+- **`-patch_return_addresses` flag**: New flag to patch return addresses for better
+  indirect call coverage on modern Windows CFG-protected binaries
+
+```bash
+# Updated Jackalope invocation for Windows 11 targets
+jackalope.exe \
+    -in corpus\ \
+    -out findings\ \
+    -t 5000 \
+    -coverage_modules target.sys \
+    -target_module harness.exe \
+    -target_method WinMain \
+    -patch_return_addresses \         # Better CFG-protected module coverage
+    -instrument_modules_on_load \     # Handle late-loaded modules
+    -- harness.exe @@
+```
+
+### 12.5.4 Coverage-Guided RPC Interface Fuzzing with `NdrClientCall2` Hooking
+
+RPC interfaces present a large and often under-fuzzed attack surface. The challenge:
+RPC clients generate NDR-encoded buffers that must be structurally valid for the server
+to even reach interesting code. Jackalope can be paired with an `NdrClientCall2`
+hooking harness to get coverage-guided fuzzing of RPC server handlers.
+
+**Approach**: Hook `NdrClientCall2` in the target RPC client DLL to intercept the NDR
+buffer before transmission. Jackalope mutates the raw NDR bytes with coverage feedback
+from the server-side handler.
+
+```cpp
+// RPC fuzzing harness skeleton using NdrClientCall2 interception
+#include <windows.h>
+#include <rpc.h>
+#include <rpcndr.h>
+
+// The NDR stub descriptor for the target interface
+// (extracted from the compiled RPC client stub using IDA/Ghidra)
+extern const MIDL_STUB_DESC TargetInterface_StubDesc;
+
+int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR lpCmdLine, int) {
+    // Read fuzzed NDR payload from Jackalope-provided file
+    HANDLE hInput = CreateFileA(lpCmdLine, GENERIC_READ, 0, NULL,
+                                OPEN_EXISTING, 0, NULL);
+    DWORD size = GetFileSize(hInput, NULL);
+    BYTE* ndrBuf = (BYTE*)malloc(size);
+    DWORD read;
+    ReadFile(hInput, ndrBuf, size, &read, NULL);
+    CloseHandle(hInput);
+
+    // Bind to the RPC server endpoint directly
+    RPC_BINDING_HANDLE hBinding = NULL;
+    RpcStringBindingCompose(NULL,
+        (RPC_WSTR)L"ncalrpc",
+        NULL,
+        (RPC_WSTR)L"target_endpoint",
+        NULL,
+        (RPC_WSTR*)&szBinding);
+    RpcBindingFromStringBinding((RPC_WSTR)szBinding, &hBinding);
+
+    // Invoke the target RPC method with fuzzed NDR buffer
+    // Method index 0 as example — enumerate all methods for full coverage
+    __try {
+        NdrClientCall2(
+            &TargetInterface_StubDesc,
+            &TargetInterface_ProcFormatString[METHOD_OFFSET_0],
+            hBinding,
+            ndrBuf   // fuzzed method-specific data
+        );
+    } __except(EXCEPTION_EXECUTE_HANDLER) {}
+
+    RpcBindingFree(&hBinding);
+    free(ndrBuf);
+    return 0;
+}
+```
+
+### 12.5.5 Jackalope for COM Server Fuzzing — `IDispatch::Invoke` Coverage
+
+COM automation servers that expose `IDispatch` are accessible from low-IL contexts
+and represent a significant attack surface. Jackalope can fuzz `IDispatch::Invoke`
+calls with coverage feedback from the COM server process.
+
+```cpp
+// COM IDispatch fuzzing harness
+#include <windows.h>
+#include <oleauto.h>
+
+int APIENTRY WinMain(HINSTANCE, HINSTANCE, LPSTR lpCmdLine, int) {
+    CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+
+    // Read fuzzed VARIANT argument data
+    HANDLE hInput = CreateFileA(lpCmdLine, GENERIC_READ, 0, NULL,
+                                OPEN_EXISTING, 0, NULL);
+    DWORD size = GetFileSize(hInput, NULL);
+    BYTE* inputBuf = (BYTE*)malloc(size);
+    DWORD read;
+    ReadFile(hInput, inputBuf, size, &read, NULL);
+    CloseHandle(hInput);
+
+    // Instantiate target COM server (out-of-proc, so COM server is the fuzzing target)
+    IDispatch* pDisp = NULL;
+    CLSID clsid;
+    // Target CLSID — enumerate accessible COM servers with OleViewDotNet
+    CLSIDFromString(L"{TARGET-CLSID-HERE}", &clsid);
+    CoCreateInstance(clsid, NULL, CLSCTX_LOCAL_SERVER,
+                     IID_IDispatch, (void**)&pDisp);
+
+    if (pDisp) {
+        // Build DISPPARAMS from fuzzed input
+        VARIANTARG varg;
+        VariantInit(&varg);
+        varg.vt = VT_BSTR;
+        // Use first 'size' bytes as a BSTR argument
+        varg.bstrVal = SysAllocStringByteLen((LPCSTR)inputBuf, size);
+
+        DISPPARAMS params = { &varg, NULL, 1, 0 };
+        VARIANT result;
+        VariantInit(&result);
+
+        // Fuzz DISPID 0 (default method) — enumerate all DISPIDs for full coverage
+        __try {
+            pDisp->Invoke(0, IID_NULL, LOCALE_USER_DEFAULT,
+                          DISPATCH_METHOD, &params, &result, NULL, NULL);
+        } __except(EXCEPTION_EXECUTE_HANDLER) {}
+
+        SysFreeString(varg.bstrVal);
+        VariantClear(&result);
+        pDisp->Release();
+    }
+
+    free(inputBuf);
+    CoUninitialize();
+    return 0;
+}
+```
+
+**Coverage target**: Specify the COM server EXE/DLL (not the harness) as
+`-coverage_modules` in Jackalope. TinyInst will instrument the out-of-process COM
+server for coverage feedback:
+
+```bash
+jackalope.exe \
+    -in corpus_com\ \
+    -out findings_com\ \
+    -t 10000 \
+    -coverage_modules comserver.dll \
+    -target_module com_harness.exe \
+    -target_method WinMain \
+    -- com_harness.exe @@
+```
+
 ---
 
 ## 12.6 WTF — Windows Kernel Fuzzing Framework
@@ -555,6 +837,99 @@ wtf fuzz --name target_name --state snapshot_dir/ --input corpus/
 | Fast iteration rate | Moderate (snapshot restore) | Fast (process restart) |
 | Coverage granularity | Basic block (requires symbol map) | Basic block (live instrumentation) |
 | Remote/distributed fuzzing | ✓ Built-in | Manual coordination needed |
+
+### 12.6.4 WTF 2024 Status — Windows 11 22H2/23H2 Support
+
+WTF has been actively maintained through 2024 with explicit support for newer Windows
+targets:
+
+- **Windows 11 22H2 and 23H2** snapshot compatibility verified; the snapshot format
+  and VMCS handling were updated to account for changes in Hyper-V enlightenments
+  present in newer builds
+- **Bochs backend updated** to handle new MSRs introduced in 22H2 that caused snapshot
+  restore failures on older WTF versions
+- **Symbol loading improvements**: WTF now handles PDB loading for Windows 11 23H2
+  kernel symbols via the updated `bxcpu` backend
+
+```bash
+# Verify WTF snapshot compatibility with your Windows 11 target
+wtf bochscpu --name check_snapshot --state /path/to/snapshot/ --input /dev/null \
+    --limit 1 --verbose
+# Expected: snapshot loads, executes 1 instruction, exits cleanly
+```
+
+### 12.6.5 New WTF Modules: `ntfs_fuzzer.cc` and `alpc_fuzzer.cc`
+
+The WTF repository gained two significant new fuzzer modules in 2024:
+
+**`ntfs_fuzzer.cc`** — Snapshot-based fuzzer for the NTFS driver (`ntfs.sys`):
+- Takes a snapshot with a mounted NTFS volume at the point `NtCreateFile` is called
+- Mutates the on-disk NTFS metadata (MFT records, index entries, attribute lists)
+  by patching the virtual disk image between iterations
+- Has been used to discover several NTFS parsing bugs; approach is directly transferable
+  to other file system drivers (`refs.sys`, `exfat.sys`)
+
+```cpp
+// ntfs_fuzzer.cc target skeleton
+bool InsertTestcase(const uint8_t *Buffer, const size_t BufferSize) {
+    // Write fuzzed NTFS sector data to the snapshot's virtual disk
+    // at offset corresponding to the MFT record being parsed
+    const uint64_t MftOffset = g_State.TargetMftOffset;
+    if (!g_Backend->VirtWriteDirty(MftOffset, Buffer,
+                                   std::min(BufferSize, (size_t)0x400))) {
+        return false;
+    }
+    return true;
+}
+```
+
+**`alpc_fuzzer.cc`** — Snapshot-based fuzzer for ALPC message handling:
+- Snapshot is taken in the kernel at the `AlpcpReceiveMessage` entry point
+- Mutates the ALPC message buffer (port message header + message body) directly
+  in kernel memory
+- Useful for finding vulnerabilities in ALPC-based IPC between SYSTEM services
+
+### 12.6.6 WTF + Hyper-V Isolation for Kernel Fuzzing
+
+For targets that require actual hardware virtualization (nested VMs, Hyper-V
+hypercalls), WTF supports a Hyper-V backend that runs the fuzzing VM inside Hyper-V
+rather than Bochs:
+
+```bash
+# Hyper-V backend — requires Windows host with Hyper-V enabled
+# Create snapshot using the Hyper-V checkpoint mechanism
+# (WTF docs: https://github.com/0vercl0k/wtf/blob/master/docs/hyperv-backend.md)
+
+wtf run --name alpc_fuzz \
+    --state snapshot_hyperv/ \
+    --input corpus_alpc/ \
+    --backend hyperv \          # Use Hyper-V instead of Bochs emulation
+    --limit 10000
+```
+
+**Advantage over Bochs backend**: Near-native execution speed for hardware-dependent
+code paths. The trade-off is that Hyper-V does not support all coverage instrumentation
+modes that Bochs does (no instruction-level tracing).
+
+### 12.6.7 Performance Comparison: WTF vs kAFL for Windows Kernel Targets
+
+kAFL (originally from Intel, now maintained at https://github.com/IntelLabs/kAFL)
+is an alternative snapshot-based kernel fuzzer that uses Intel PT for coverage.
+Comparison for Windows kernel targets:
+
+| Metric | WTF (Bochs) | WTF (Hyper-V) | kAFL (Intel PT) |
+|---|---|---|---|
+| Iterations/sec (simple handler) | ~5,000–15,000 | ~50,000–200,000 | ~30,000–150,000 |
+| Coverage granularity | Basic block (emulated) | Basic block (Intel PT) | Edge coverage (Intel PT) |
+| Windows 11 support | Yes (verified 23H2) | Yes | Partial (requires custom kernel) |
+| Snapshot fidelity | High (full CPU state) | High | High |
+| Setup complexity | Medium | High | High |
+| Distributed fuzzing | Built-in | Built-in | Manual (AFL++ compatible) |
+| Hardware dependency | None (emulated) | Intel/AMD VT-x | Intel PT required |
+
+**Practical guidance**: For initial exploration and portability, start with WTF (Bochs).
+When iteration rate becomes the bottleneck and hardware with Intel PT is available,
+kAFL or WTF (Hyper-V) provides a 10–50x improvement.
 
 ---
 
@@ -683,6 +1058,81 @@ The AdminProtection bypass series demonstrates every principle of systematic var
    This is consistent with historical patterns for new Windows security features
    (UAC had similar variant rates in its first years).
 
+### 12.8.4 CVE-2025-21204 — Administrator Protection Bypass via Windows Update Symlink
+
+**Vulnerability**: `TiWorker.exe` (the Windows Update worker process, running as SYSTEM)
+writes files to `C:\Config.Msi` without checking whether the path has been replaced by
+a junction or symlink.
+
+**Root cause analysis (itm4n)**:
+
+itm4n's analysis of CVE-2025-21204 identified the following exploitation chain:
+1. `TiWorker.exe` creates or writes rollback/logging files to `C:\Config.Msi\` during
+   a Windows Update or MSI installation operation
+2. The path construction in `TiWorker.exe` does not call `NtCreateFile` with
+   `FILE_FLAG_OPEN_REPARSE_POINT` — it follows symlinks and junctions transparently
+3. A low-privilege attacker who can create `C:\Config.Msi` before the update operation
+   (or replace it with a junction) can redirect the SYSTEM write to an arbitrary path
+4. This achieves an arbitrary file write as SYSTEM, which can be escalated to full
+   code execution via DLL planting or service binary replacement
+
+**`TiWorker.exe` file operation enumeration for variants**:
+
+```powershell
+# Monitor TiWorker.exe file operations with ProcMon filter
+# ProcMon filter: Process Name is TiWorker.exe AND Operation is WriteFile OR CreateFile
+# Look for:
+#   - Paths under C:\ that are not fully qualified as C:\Windows\...
+#   - Paths containing user-writable intermediate directories
+#   - Paths that do not use FILE_FLAG_OPEN_REPARSE_POINT
+
+# ETW-based monitoring (no ProcMon required)
+$session = New-EtwTraceSession -Name "TiWorkerTrace" -LogFileName "C:\tiworker.etl"
+Add-EtwTraceProvider -SessionName "TiWorkerTrace" `
+    -Guid "{9b79ee97-b5c5-45d0-8af3-7b82e9e91d84}" `  # Microsoft-Windows-Kernel-File
+    -Level 4 `
+    -MatchAnyKeyword 0x10  # KERNEL_FILE_KEYWORD_FILEIO_WRITE
+
+Start-Process "C:\Windows\System32\TiWorker.exe" -ArgumentList "-embedding"
+# Trigger Windows Update check
+Start-Sleep 30
+Stop-EtwTraceSession -Name "TiWorkerTrace"
+
+# Analyze the ETL for writes outside C:\Windows\
+tracerpt C:\tiworker.etl -o tiworker_report.xml
+```
+
+**Variant discovery methodology**: The key insight from CVE-2025-21204 is that any
+`TiWorker.exe` file write operation to a path that:
+1. Is not under `C:\Windows\` or `C:\Program Files\`
+2. Does not use `FILE_FLAG_OPEN_REPARSE_POINT`
+3. Occurs when the target directory can be raced or pre-created by a low-privilege user
+
+...is a candidate for a symlink-based privilege escalation variant.
+
+**Detection via ETW**:
+
+```powershell
+# Detect junction/symlink creation followed by TiWorker write
+# Using Microsoft-Windows-Security-Auditing provider
+
+# Event 4663: Object Access — filter for TiWorker.exe and NtCreateSymbolicLinkObject
+Get-WinEvent -FilterHashtable @{
+    LogName = 'Security'
+    Id = 4663
+} | Where-Object {
+    $_.Properties[1].Value -match "TiWorker" -or
+    $_.Properties[6].Value -match "Config.Msi"
+} | Select-Object TimeCreated, Message
+
+# Alternative: ETW trace for NtCreateSymbolicLinkObject by low-IL processes
+# combined with subsequent TiWorker.exe write operations to same path
+$filterScript = {
+    $_.ProviderName -eq "Microsoft-Windows-Kernel-File" -and
+    $_.Message -match "Config.Msi"
+}
+```
+
 ---
 
 ## 12.9 Building a Fuzzing → Triage → Root Cause Pipeline
@@ -803,6 +1253,410 @@ Systematic scan:
 
 ---
 
+## 12.11 CVE-2024-21338 Variant Class Analysis
+
+### 12.11.1 Background: The `appid.sys` Exploit Class
+
+CVE-2024-21338 was a Windows AppLocker kernel driver (`appid.sys`) vulnerability
+exploited in the wild by the Lazarus Group (DPRK). The exploitation technique involved
+an IOCTL interface in `appid.sys` that was callable from user mode at medium IL, leading
+to a kernel memory corruption vulnerability.
+
+The significance for variant hunting: this bug demonstrated that Windows security
+drivers — processes and drivers that are PPL-protected (Protected Process Light) or
+otherwise have elevated trust — can expose IOCTL interfaces callable from less-privileged
+contexts. The IOCTL handler may perform operations that assume the caller has already
+been validated by a higher-level check that does not apply at the kernel IOCTL level.
+
+### 12.11.2 The Attack Pattern: PPL-Protected Drivers with Accessible IOCTLs
+
+The `appid.sys` pattern:
+1. Driver is PPL-protected (its process cannot be tampered from non-PPL code)
+2. Driver registers a device (`\Device\AppID`) accessible from user mode at medium IL
+3. The IOCTL handler at `IOCTL_APPID_*` performs kernel operations without sufficient
+   bounds checking on attacker-controlled input
+4. Memory corruption in kernel pool → privilege escalation
+
+**Why this creates a variant class**: Windows security drivers must be callable from
+the processes they protect — which means they must expose IOCTL interfaces. But the
+callers are constrained (only the security product's user-mode agent calls them), so
+the IOCTL handlers are not written with the same adversarial input assumptions as
+general kernel interfaces.
+
+### 12.11.3 Enumerating IOCTL Interfaces on PPL Processes
+
+The research methodology for finding similar drivers:
+
+```powershell
+# Step 1: Enumerate devices accessible from medium IL
+Import-Module NtObjectManager
+
+# List all device objects and their security descriptors
+Get-NtObject -Path "\Device" -DirectoryOnly | ForEach-Object {
+    try {
+        $obj = Get-NtObject -Path "\Device\$($_.Name)" -ErrorAction Stop
+        $sd = $obj.SecurityDescriptor
+        # Check if readable/writable by medium IL (standard users)
+        $access = Test-NtAccessMask -SecurityDescriptor $sd `
+                  -Access 0xC0000000 `  # GENERIC_READ | GENERIC_WRITE
+                  -ProcessIntegrity Medium
+        if ($access) {
+            Write-Output "ACCESSIBLE: \Device\$($_.Name)"
+        }
+        $obj.Close()
+    } catch {}
+}
+```
+
+```powershell
+# Step 2: Cross-reference with PPL/security driver list
+$securityDrivers = @(
+    "appid.sys",    # AppLocker — CVE-2024-21338 (patched)
+    "cng.sys",      # Cryptography Next Generation
+    "ci.dll",       # Code Integrity
+    "ksecdd.sys",   # Kernel Security Support Provider
+    "fvevol.sys",   # BitLocker (Full Volume Encryption)
+    "wdboot.sys",   # Windows Defender Boot Driver
+    "hvsimp.sys",   # Hypervisor-protected Code Integrity
+    "peauth.sys"    # Protected Environment Authentication
+)
+
+# Check which security drivers expose accessible device objects
+foreach ($driver in $securityDrivers) {
+    $driverName = [System.IO.Path]::GetFileNameWithoutExtension($driver)
+    Get-NtObject -Path "\Device" -DirectoryOnly | Where-Object {
+        $_.Name -match $driverName
+    } | ForEach-Object {
+        Write-Output "Security driver device: \Device\$($_.Name) (from $driver)"
+    }
+}
+```
+
+### 12.11.4 IOCTL Handler Analysis Methodology
+
+For each accessible device associated with a security driver:
+
+**Step 1: Extract IOCTL codes via IDA/Ghidra**
+
+The dispatch table for IRP_MJ_DEVICE_CONTROL lists the IOCTL handler. Enumerate
+all IOCTL codes by finding the `switch` statement or dispatch table in the handler:
+
+```python
+# IDA Python script to enumerate IOCTL codes from a driver's dispatch function
+import idaapi
+import idautils
+
+def find_ioctl_codes(dispatch_func_ea):
+    """
+    Walk the IRP_MJ_DEVICE_CONTROL handler looking for comparison
+    instructions against IOCTL code constants.
+    """
+    ioctl_codes = []
+    for insn in idautils.FuncItems(dispatch_func_ea):
+        if idc.print_insn_mnem(insn) in ('cmp', 'sub'):
+            op2 = idc.get_operand_value(insn, 1)
+            # IOCTL codes follow the CTL_CODE macro pattern:
+            # Bits 31-16: Device type, bits 15-14: Access, bits 13-2: Function, bits 1-0: Method
+            if 0x00220000 <= op2 <= 0x0022FFFF or \
+               0x00040000 <= op2 <= 0x0004FFFF:
+                ioctl_codes.append(op2)
+                print(f"IOCTL code candidate: 0x{op2:08X} at 0x{insn:X}")
+    return ioctl_codes
+```
+
+**Step 2: WinDbg trace each IOCTL handler for memory operations**
+
+```windbg
+; Set up IOCTL handler breakpoint
+bp \Device\TargetDriver!IrpMjDeviceControl
+
+; When hit, log the input buffer and length
+.printf "IOCTL: 0x%x, InputLen: 0x%x\n", \
+    poi(@rsp+0x28),   ; IoControlCode
+    poi(@rsp+0x30)    ; InputBufferLength
+
+; Enable pool tagging to catch pool corruptions
+!gflag +hpa
+!pool
+
+; Break on pool corruption detection
+bp nt!ExFreePoolWithTag ".if (poi(@rcx+0x100) != poi(@rcx)) {.echo CORRUPTION; k} .else {g}"
+```
+
+### 12.11.5 Candidate Drivers for the `appid.sys` Variant Class
+
+Based on the methodology above, the following drivers represent research candidates
+(as of H1 2024 — some may have been patched in H2 2024):
+
+| Driver | Device Object | IOCTL Surface | Notes |
+|---|---|---|---|
+| `cng.sys` | `\Device\CNG` | Key management, RNG | Accessible from medium IL; complex IOCTL interface |
+| `ksecdd.sys` | `\Device\KsecDD` | LSA/SSPI operations | Used by LSASS; IOCTL handlers handle sensitive crypto buffers |
+| `fvevol.sys` | `\Device\FveVol` | BitLocker volume ops | Callable during pre-boot auth setup |
+| `ci.dll` | (kernel component, no direct device) | Code integrity checks | Exposed via NtSetSystemInformation class |
+
+**Note**: MSRC acknowledged several variants in this class and issued patches in the
+H2 2024 Patch Tuesday cycles (specific CVE numbers not confirmed at time of writing;
+check MSRC advisory portal for `appid.sys` variant class bulletins).
+
+### 12.11.6 Responsible Research Approach
+
+Given that these are security drivers with active protections:
+1. Conduct all testing in an isolated VM with kernel debugging enabled
+2. Use WTF snapshot fuzzing rather than live system testing (avoids corrupting the
+   host's security state)
+3. Report findings to MSRC before publication; the IOCTL interfaces in security drivers
+   are not publicly documented, so independent discovery is achievable
+
+---
+
+## 12.12 LLM-Assisted Variant Hunting (2024–2025 Emerging Technique)
+
+### 12.12.1 Overview and Current State
+
+Large Language Models (LLMs) began appearing in practical Windows security research
+workflows in 2024. The application is not autonomous vulnerability discovery — current
+LLMs lack the symbolic reasoning required for reliable bug-finding — but rather as a
+force multiplier for specific subtasks in the variant hunting pipeline.
+
+The primary use cases where LLMs add demonstrable value:
+1. **Decompiled code triage**: Ranking candidate functions by likelihood of containing
+   a specific vulnerability pattern
+2. **Crash report summarization**: Converting raw WinDbg crash output into structured
+   summaries for deduplication
+3. **Documentation generation**: Producing structured analysis notes from IDA/Ghidra
+   comments and disassembly
+
+### 12.12.2 LLM for Decompiled Code Review
+
+The workflow for using GPT-4 or Claude for decompiled code review:
+
+```python
+#!/usr/bin/env python3
+"""
+LLM-assisted decompiled function triage.
+Input: list of decompiled functions (from IDA Hex-Rays or Ghidra decompiler)
+Output: ranked list of functions by vulnerability likelihood
+"""
+
+import anthropic
+import json
+
+SYSTEM_PROMPT = """You are a Windows kernel security researcher reviewing decompiled C code.
+For each function, identify potential vulnerability patterns:
+- Missing bounds checks on size parameters before memcpy/memmove
+- Missing NULL checks on pointer parameters before dereference
+- Integer overflow in size calculations (multiplication before allocation)
+- Use of user-supplied pointers in kernel context without ProbeForRead/Write
+- Missing impersonation before privileged file/registry operations
+
+Respond with JSON: {"risk": "high|medium|low", "pattern": "<pattern name>", "reason": "<1 sentence>"}
+"""
+
+def triage_function(decompiled_code: str) -> dict:
+    client = anthropic.Anthropic()
+    response = client.messages.create(
+        model="claude-opus-4-5",
+        max_tokens=256,
+        system=SYSTEM_PROMPT,
+        messages=[{
+            "role": "user",
+            "content": f"Review this decompiled kernel function:\n\n```c\n{decompiled_code}\n```"
+        }]
+    )
+    try:
+        return json.loads(response.content[0].text)
+    except json.JSONDecodeError:
+        return {"risk": "unknown", "pattern": "", "reason": response.content[0].text}
+
+# Example: triage a batch of Ghidra-decompiled functions
+if __name__ == "__main__":
+    import sys
+    functions = json.load(open(sys.argv[1]))  # {"name": str, "code": str}[]
+    results = []
+    for fn in functions:
+        result = triage_function(fn["code"])
+        result["name"] = fn["name"]
+        results.append(result)
+        print(f"{fn['name']}: {result['risk']} — {result['pattern']}")
+
+    # Sort by risk: high → medium → low
+    priority = {"high": 0, "medium": 1, "low": 2, "unknown": 3}
+    results.sort(key=lambda r: priority.get(r["risk"], 3))
+    json.dump(results, open("triage_results.json", "w"), indent=2)
+```
+
+**Important caveats**:
+- LLMs operate on text without symbolic context: they cannot track pointer provenance,
+  understand Windows kernel data structures, or reason about control flow graphs
+- False positive rate is high (30–60% in practice) — LLM triage reduces the candidate
+  set, it does not confirm vulnerabilities
+- Use as a first-pass filter before manual review, not as a standalone verdict
+
+### 12.12.3 LLM as Triage Layer for Jackalope Crash Reports
+
+Jackalope crash reports consist of a stack trace, crash address, and crash context.
+Processing hundreds of crashes manually for deduplication and preliminary severity
+assessment is time-consuming. LLMs can assist:
+
+```python
+#!/usr/bin/env python3
+"""
+LLM-assisted Jackalope crash triage.
+Reads WinDbg crash dumps from Jackalope findings directory,
+produces structured JSON summary for each unique crash.
+"""
+
+import anthropic
+import os
+import subprocess
+
+CRASH_TRIAGE_PROMPT = """Analyze this WinDbg crash output from a Windows kernel fuzzer.
+Provide:
+1. Crash type (heap corruption, null deref, stack overflow, use-after-free, other)
+2. Likely exploitability (exploitable, probably exploitable, probably not, unknown)
+3. Crash location (kernel module + function if identifiable from stack trace)
+4. Suggested deduplication key (3-4 most relevant stack frames)
+
+Format: JSON with keys: crash_type, exploitability, location, dedup_key, summary
+"""
+
+def analyze_crash(crash_log: str) -> dict:
+    client = anthropic.Anthropic()
+    response = client.messages.create(
+        model="claude-haiku-4-5",   # Use Haiku for cost efficiency on bulk triage
+        max_tokens=512,
+        messages=[{
+            "role": "user",
+            "content": f"{CRASH_TRIAGE_PROMPT}\n\nCrash log:\n```\n{crash_log}\n```"
+        }]
+    )
+    import json
+    try:
+        return json.loads(response.content[0].text)
+    except json.JSONDecodeError:
+        return {"crash_type": "parse_error", "summary": response.content[0].text}
+
+def process_jackalope_findings(findings_dir: str):
+    crashes = []
+    for root, dirs, files in os.walk(findings_dir):
+        for f in files:
+            if f.endswith(".txt") or f.endswith(".log"):
+                log_path = os.path.join(root, f)
+                with open(log_path) as fh:
+                    crash_log = fh.read()
+                result = analyze_crash(crash_log)
+                result["file"] = f
+                crashes.append(result)
+                print(f"Triaged: {f} -> {result.get('exploitability', '?')} / {result.get('crash_type', '?')}")
+    return crashes
+```
+
+### 12.12.4 Limitations of LLM-Based Variant Hunting
+
+| Limitation | Impact | Mitigation |
+|---|---|---|
+| No symbolic context | Cannot track pointer provenance across function calls | Use only for single-function triage; verify with IDA/Ghidra |
+| No data structure knowledge | Windows kernel structs (EPROCESS, KTHREAD, etc.) are opaque | Provide struct definitions in the prompt; partial improvement |
+| High false positive rate | 30–60% of "high risk" flags are false positives | Treat as candidate filter, always verify manually |
+| Token context limits | Large functions exceed context window | Chunk at logical boundaries (loops, conditionals) |
+| No cross-call analysis | Cannot reason about calling context or permissions | Provide caller context manually if critical |
+| Training data cutoff | Novel 2024+ vulnerability classes may be underrepresented | Supplement with few-shot examples of the target pattern |
+
+### 12.12.5 Microsoft's AI-Assisted Security Research Program (2024)
+
+In 2024, Microsoft announced expanded use of AI in their internal Security Response
+Center workflows:
+- **CyberSecEval** benchmarks were published for evaluating LLM security capabilities
+- **Microsoft Security Copilot** (formerly Security Copilot, now Microsoft Copilot for
+  Security) was made generally available in April 2024, with integrations into MSRC
+  triage workflows
+- Microsoft Research published papers on using LLMs for fuzzing guidance (seed selection
+  and mutation strategy improvement), though primarily for user-mode targets
+
+The practical implication for independent researchers: Microsoft's internal triage
+velocity is increasing, which means the window between bug discovery and patch is
+likely to compress further. Variant hunting efficiency improvements matter more.
+
+### 12.12.6 The DBRIDA Technique: Differential Binary Review with AI Assistance
+
+**DBRIDA** (Differential Binary Review with Integrated AI Assistance) is an emerging
+technique for patch analysis that combines:
+1. **BinDiff** for identifying changed functions between patched and unpatched builds
+2. **Hex-Rays / Ghidra decompilation** of the changed functions
+3. **LLM analysis** of the decompiled diff to identify what security check was added
+4. **Automated variant generation**: prompt the LLM to describe the root cause and
+   suggest other code patterns that might share the same root cause
+
+```python
+#!/usr/bin/env python3
+"""
+DBRIDA: Differential Binary Review with AI Assistance
+Workflow:
+1. Run BinDiff to get list of changed functions between old/new build
+2. Decompile changed functions with IDA Hex-Rays
+3. LLM analysis: what security check was added?
+4. LLM variant suggestion: where else might this pattern appear?
+"""
+
+import anthropic
+import json
+
+DBRIDA_PROMPT = """You are analyzing a security patch applied to a Windows kernel binary.
+You are given the decompiled pseudocode of a function BEFORE and AFTER the patch.
+
+Tasks:
+1. Identify what security check or validation was added/changed in the patch
+2. Describe the root cause in one sentence (what was the bug class?)
+3. Suggest 3-5 other function name patterns that might share this root cause
+   (based on naming conventions in Windows kernel: Nt*, Zw*, Ex*, Rtl*, etc.)
+4. Write a one-line Semgrep-style pattern description for the vulnerable pattern
+
+Format: JSON with keys: patch_description, root_cause, variant_candidates, semgrep_hint
+"""
+
+def analyze_patch_diff(before_code: str, after_code: str) -> dict:
+    client = anthropic.Anthropic()
+    response = client.messages.create(
+        model="claude-opus-4-5",
+        max_tokens=1024,
+        messages=[{
+            "role": "user",
+            "content": (
+                f"{DBRIDA_PROMPT}\n\n"
+                f"BEFORE (vulnerable):\n```c\n{before_code}\n```\n\n"
+                f"AFTER (patched):\n```c\n{after_code}\n```"
+            )
+        }]
+    )
+    try:
+        return json.loads(response.content[0].text)
+    except json.JSONDecodeError:
+        return {"root_cause": response.content[0].text}
+```
+
+**Example DBRIDA output** for a hypothetical patch:
+```json
+{
+  "patch_description": "Added ProbeForRead check on user-supplied pointer before kernel dereference",
+  "root_cause": "Kernel function dereferenced attacker-controlled pointer without validating it lies in user address space",
+  "variant_candidates": [
+    "NtUserGetMessage",
+    "NtUserPeekMessage",
+    "NtUserMsgWaitForMultipleObjectsEx",
+    "NtUserWaitForInputIdle",
+    "NtUserCallMsgFilter"
+  ],
+  "semgrep_hint": "Kernel function accepting PMESSAGE parameter that dereferences it without ProbeForRead"
+}
+```
+
+The `variant_candidates` list from DBRIDA feeds directly into a targeted static
+analysis pass (CodeQL or IDA scripting), converting LLM output into actionable
+research leads.
+
+---
+
 ## References
 
 [R-1] Project Zero Variant Hunting Methodology
@@ -825,3 +1679,18 @@ Systematic scan:
 
 [R-7] Bochspwn Reloaded — Automated Kernel Variant Discovery
   — j00ru / Google Project Zero — https://j00ru.vexillium.org/talks/blackhat17-bochspwn-reloaded/
+
+[R-8] Windows Driver Developer Supplemental Tools (MSRC CodeQL queries)
+  — Microsoft — https://github.com/microsoft/Windows-Driver-Developer-Supplemental-Tools
+
+[R-9] CVE-2024-21338 — AppLocker AppID Driver LPE
+  — MSRC Advisory — https://msrc.microsoft.com/update-guide/vulnerability/CVE-2024-21338
+
+[R-10] CVE-2025-21204 — Administrator Protection Bypass (TiWorker symlink)
+  — itm4n analysis — https://itm4n.github.io/
+
+[R-11] kAFL — Hardware-Assisted Kernel Fuzzing
+  — Intel Labs — https://github.com/IntelLabs/kAFL
+
+[R-12] Microsoft Copilot for Security — GA Announcement (April 2024)
+  — Microsoft — https://www.microsoft.com/en-us/security/blog/

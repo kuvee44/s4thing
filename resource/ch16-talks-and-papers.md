@@ -486,18 +486,283 @@ The limitations of PPL: a driver loaded at the right signer level can bypass PP/
 
 ---
 
+### FudModule: Stealthy Kernel Exploitation via Driver Vulnerability
+**Speaker:** AhnLab / ANSSI researchers
+**Conference:** Recon Brussels 2024 / AVAR 2024
+**Reference:** AhnLab-ASEC joint whitepaper "Lazarus Group's FudModule Rootkit v2" (February 2024)
+
+**What it introduced:**
+
+A detailed technical post-mortem of the Lazarus Group's FudModule v2 rootkit, which used a vulnerability in `appid.sys` (Application Identity driver, a built-in Windows component) to escalate from user mode to kernel context — without loading an external driver (no BYOVD).
+
+**The exploitation chain:**
+
+The `appid.sys` driver is a signed Microsoft component used by AppLocker. It exposes IOCTL handlers accessible from medium-integrity processes. The specific IOCTL vulnerability allowed a crafted input to trigger a controlled write relative to a kernel object pointer — a write-what-where primitive obtained through the AppID driver.
+
+From that single primitive, the Lazarus Group's code overwrote kernel callback table entries. Specifically, they modified `PsSetCreateProcessNotifyRoutine`-registered callbacks and `ObRegisterCallbacks`-registered callbacks:
+- Removing EDR/AV callback registrations to blind security products to process creation and object access events
+- This is a **data-only attack** — no shellcode is injected, no unsigned code executes in kernel. The attack only modifies data structures that control which callbacks fire.
+
+**Why it matters — data-only kernel attacks:**
+
+HVCI (Hypervisor-Protected Code Integrity) prevents executing unsigned code in kernel mode. It does not prevent modifying kernel data structures — callback tables, token fields, `_EPROCESS` fields — if the attacker already has a kernel write primitive. FudModule v2 demonstrates that a fully HVCI-enabled system can still be blinded at the kernel level if the attacker has a driver IOCTL vulnerability in a signed component.
+
+The callback table overwrite achieves persistent EDR blindness without triggering code integrity checks because no new executable pages are created. The modification is to data, not code.
+
+**Reading priority:** High for anyone studying kernel exploitation combined with APT tradecraft. Essential companion to the "Pool Is Dead" and I/O Ring primitive material — FudModule shows what a real-world advanced adversary builds once they have a kernel write primitive.
+
+**Framework 5-question analysis:**
+
+1. *Class:* Kernel write-what-where via trusted signed driver IOCTL; data-only kernel manipulation (callback table overwrite)
+2. *Discovery:* Threat intelligence / reverse engineering of captured malware; not offensive research finding the original bug
+3. *Exploitation:* IOCTL → kernel write primitive → callback table overwrite → EDR blindness → persistent rootkit behavior
+4. *Patch:* CVE assigned to the `appid.sys` vulnerability; patched. The data-only attack pattern itself has no patch — HVCI does not protect mutable kernel data.
+5. *Generalization:* Enumerate signed Windows kernel drivers (`.sys` files in `System32\drivers\`) for IOCTL handlers with weak input validation. Signed drivers are not reviewed as carefully as the kernel itself. The `appid.sys` attack surface (a component tied to AppLocker, present on enterprise systems) exemplifies this: a rarely-audited signed driver becomes a kernel write primitive source.
+
+---
+
+### The COM-Back: Revisiting COM Activation Security
+**Speaker/Author:** James Forshaw (Google Project Zero)
+**Platform:** Project Zero Blog / presentation (January 2025)
+**Reference:** Search "Forshaw COM activation security 2025" / Project Zero blog
+
+**What it introduced:**
+
+A deep-dive into the COM activation security model, focusing specifically on **elevation monikers** — the mechanism COM uses to allow a lower-privilege process to instantiate a COM server running at a higher integrity level. Forshaw identified a new vulnerability class in how elevation monikers are processed that allows medium-integrity processes to abuse the `CoCreateInstance` elevation path.
+
+**Technical mechanism — elevation moniker abuse:**
+
+When a COM client calls `CoCreateInstance` with `CLSCTX_LOCAL_SERVER` and the target CLSID is registered with an elevation key (under `HKLM\SOFTWARE\Classes\CLSID\{...}\Elevation`), the COM infrastructure invokes a privileged COM activator (`rpcss.exe` → `DllHost.exe` at high IL) to create the server. The elevation uses a UAC-like prompt to confirm user intent.
+
+The vulnerability: certain code paths in the elevation moniker resolution do not correctly re-validate the caller's identity or the server's registration after initial validation. A crafted sequence of COM activation calls from medium IL can trigger the privileged activator without a UAC prompt, obtaining a high-IL COM server interface from medium IL.
+
+**Why this matters for the attack surface:**
+
+COM elevation monikers are used pervasively in Windows for built-in tools that require short privilege escalations (Task Scheduler UI, Device Manager, disk management). An exploitable activation path that bypasses UAC from medium IL gives SYSTEM-equivalent COM interfaces to an unprivileged attacker. Since many COM servers run as SYSTEM or high IL and expose rich object models, this is a direct LPE path.
+
+**Reading priority:** Essential after completing ch05 (RPC/COM/ALPC). Forshaw's prior COM work (DEF CON 25 namespace talk, various Project Zero issues) established the attack surface; this extends it with a new activation security class discovered in 2025.
+
+**Framework 5-question analysis:**
+
+1. *Class:* COM activation privilege boundary confusion — elevation moniker processed without proper caller re-validation
+2. *Discovery:* Manual code review of COM activation infrastructure; variant hunting from prior COM elevation research
+3. *Exploitation:* Medium-IL process calls crafted COM activation sequence → obtains high-IL or SYSTEM COM server interface → uses server's methods for LPE actions
+4. *Patch:* Point fix in the activation code path. COM activation complexity means variant hunting is likely to continue finding related bugs.
+5. *Generalization:* The elevation moniker class is distinct from the object namespace symlink class (Forshaw DEF CON 25). New entry point: any `CoCreateInstance` call path that touches an `Elevation` registry key is a candidate for activation security testing. Review all CLSIDs with `Elevation\Enabled=1` in HKLM for whether the activation validation can be bypassed.
+
+---
+
+### Administrator Protection: Attack and Defense
+**Speaker:** Multiple researchers (Microsoft, external security researchers)
+**Conference:** OffensiveCon 2024 / Hardwear.io 2024
+**Reference:** CVE-2025-21204 background material; Windows 11 24H2 Administrator Protection documentation
+
+**What it introduced:**
+
+Coverage of the new **Administrator Protection** feature introduced in Windows 11 24H2 — a redesign of how administrator accounts handle privilege elevation that goes beyond traditional UAC. Administrator Protection creates a separate, isolated administrator token using Windows Hello authentication; the user's normal token runs at standard user privileges, and elevation requires a Windows Hello gesture rather than a password prompt.
+
+**The attack surface this introduces:**
+
+- **JIT token creation:** Administrator Protection issues a Just-In-Time elevated token on demand. The token creation process involves a handoff through `consent.exe` and the Windows Hello infrastructure. Race conditions and confused deputy bugs in this handoff path are an active research area.
+- **Windows Hello authentication bypass:** If the Windows Hello authentication step can be bypassed (via hardware key cloning, TPM interaction bugs, or credential provider exploitation), the JIT elevated token is obtained without user confirmation.
+- **Installer detection bypass:** Administrator Protection includes an automatic installer detection mechanism (programs with names like `setup.exe`, `install.exe` trigger different elevation behavior). The detection heuristics are bypassable, allowing controlled programs to receive elevated tokens without matching the installer pattern.
+- **CVE-2025-21204 background:** A vulnerability in the Administrator Protection implementation affecting how the isolated admin account interacts with the filesystem, leading to privilege escalation from standard user to administrator.
+
+**Reading priority:** Important for understanding ch03 security model changes. This is the most significant Windows privilege model change since UAC (Vista, 2007). Researchers tracking Windows LPE need to understand both the protection model and its attack surface.
+
+**Framework 5-question analysis:**
+
+1. *Class:* New security feature attack surface — JIT token creation race, authentication bypass, installer detection heuristic bypass
+2. *Discovery:* Feature analysis (new feature → enumerate its components → find where each component can be attacked)
+3. *Exploitation:* Varies by specific bug — JIT race → duplicate elevated token; Hello bypass → token obtained without user confirmation
+4. *Patch:* Per-CVE fixes; the feature itself is still being hardened through 2025
+5. *Generalization:* New security features are high-value targets because they are less reviewed than mature code. Methodology: when a major security feature ships, immediately enumerate its components (authentication step, token creation step, interprocess communication paths, registry/filesystem interactions) and apply the confused deputy question to each.
+
+---
+
+### Windows Kernel Pool Exploitation 2024: What Still Works
+**Speaker:** Multiple researchers
+**Conference:** DEF CON 32 / Black Hat USA 2024
+**Reference:** Pool Party follow-on research; CNG driver pool analysis
+
+**What it introduced:**
+
+An updated state-of-the-art for kernel pool exploitation after the Pool Party vulnerability class (CVE-2023-28243 et al.) introduced new primitives in 2023, and after subsequent mitigations were deployed. Documents which exploitation techniques remain viable on fully-patched Windows 11 24H2 systems.
+
+**New primitives documented:**
+
+- **CNG driver pool exploitation:** The Cryptography Next Generation (CNG) kernel driver (`cng.sys`) performs pool allocations with patterns that remain exploitable even after Pool Party mitigations. Specifically, certain `BCRYPT_*` object types have allocation characteristics (fixed size, controllable timing, high allocation frequency) that enable reliable pool feng shui for cross-cache attacks.
+
+- **EX_PUSH_LOCK exploitation:** `EX_PUSH_LOCK` structures (lightweight reader-writer locks used throughout the kernel) in certain configurations retain inline fields that can be overwritten by an adjacent overflow. The overwritten fields influence lock acquisition behavior in ways that can be turned into a further primitive.
+
+- **Pool Party detection evasion:** Pool Party (2023) introduced legitimate thread pool worker exploitation techniques that some EDR products now detect via callback pattern analysis. The 2024 follow-on documents evasion: using different thread pool queue types, indirect callback registration, and timing-based techniques that avoid the specific detection signatures.
+
+**Reading priority:** Required after ch10 (kernel internals chapter). Post-2023 pool exploitation is a moving target — this material represents the current state for researchers working on kernel exploitation primitives.
+
+**Framework 5-question analysis:**
+
+1. *Class:* Kernel pool heap corruption exploitation — cross-cache attack, push lock primitive, thread pool manipulation
+2. *Discovery:* Systematic enumeration of pool allocation patterns per driver; detection evasion from reverse engineering EDR signatures
+3. *Exploitation:* Driver-specific pool primitive → cross-cache overflow → kernel write → token swap → SYSTEM
+4. *Patch:* Ongoing; specific primitives patched as discovered. Evasion techniques remain unaddressed at the architectural level.
+5. *Generalization:* The approach: for any kernel driver with a vulnerability (OOB write, UAF), enumerate the pool allocation characteristics of the target object and candidate spray objects. Find pairs where the target and spray objects can be co-located in the same pool page. CNG is one example; the methodology applies to any driver.
+
+---
+
+### ALPC Race Conditions: A Persistent Attack Surface
+**Speaker:** Security researchers
+**Conference:** Hexacon 2024 (Paris)
+**Reference:** CVE-2024-30088 root cause analysis; CVE-2025-21418
+
+**What it introduced:**
+
+A systematic analysis of ALPC (Advanced Local Procedure Call) race condition vulnerabilities as a recurring bug class. Covers the root cause of CVE-2024-30088 (an ALPC race that led to LPE) and the methodology for discovering similar races using Time Travel Debugging (TTD) combined with WinDbg.
+
+**The ALPC race class:**
+
+ALPC connections involve multiple kernel objects: the connection port, the server handle, per-message attributes (security context, view handles, handle attributes). These objects have reference counts that must be managed across concurrent connection, message send, disconnect, and reply operations. The race conditions arise from sequences where:
+
+1. Thread A holds a reference to an ALPC port object
+2. Thread B closes its end of the connection, triggering object cleanup
+3. Thread A proceeds with an operation on the now-partially-freed object
+4. The partially-freed object's fields are in a state that allows primitive extraction
+
+**Methodology — TTD + WinDbg for race discovery:**
+
+TTD (Time Travel Debugging) records a deterministic execution trace. For ALPC race hunting:
+1. Record a trace of the vulnerable operation sequence under TTD
+2. Set memory access breakpoints on the target ALPC object's reference count field
+3. Replay the trace, observing exactly when each thread reads/writes the reference count
+4. Identify windows where the reference count reaches zero while another thread still holds a pointer
+5. The window size (in instructions) determines exploitability — larger windows are more reliably raceable
+
+CVE-2025-21418 (a February 2025 patch) had a similar ALPC race root cause, indicating that the class remains productive after CVE-2024-30088 was fixed.
+
+**Reading priority:** Important for ch05 (ALPC section). The TTD-based race analysis methodology is directly applicable to any race condition class, not just ALPC.
+
+**Framework 5-question analysis:**
+
+1. *Class:* ALPC object reference count race — use-after-free or TOCTOU on ALPC kernel objects during concurrent connection lifecycle operations
+2. *Discovery:* TTD trace recording + WinDbg memory access breakpoints on reference count fields
+3. *Exploitation:* Race the reference count to zero while retaining a dangling pointer → use dangling pointer for UAF primitive → kernel write → SYSTEM
+4. *Patch:* CVE-2024-30088 fixed; CVE-2025-21418 fixed. Point fixes per instance. The structural ALPC concurrency model was not redesigned.
+5. *Generalization:* Apply the TTD race analysis methodology to any kernel subsystem with concurrent object lifecycle operations: ALPC, LPC, named pipe server connections, WMI, COM server connections. Record a trace, instrument reference count fields, find windows.
+
+---
+
+### Breaking Out of AppContainers in 2024
+**Speaker:** Security researchers
+**Conference:** BlueHat IL 2024 / OffensiveCon 2024
+**Reference:** CVE-2024-49039 background; Task Scheduler RPC from AppContainer analysis
+
+**What it introduced:**
+
+Analysis of multiple AppContainer escape techniques discovered or detailed in 2024, with focus on the Task Scheduler RPC interface as an unexpectedly accessible attack surface from sandboxed processes.
+
+**CVE-2024-49039 — Task Scheduler RPC from AppContainer:**
+
+Task Scheduler exposes an RPC interface (`ITaskSchedulerService`) that, by design, should not be callable from AppContainer processes. The capability check relies on the caller's AppContainer SID being absent from the allowed caller set. A configuration error in how the Task Scheduler RPC endpoint validated AppContainer identity allowed AppContainer processes to call specific Task Scheduler RPC methods — specifically methods that interact with file paths and registered task configurations.
+
+The result: an AppContainer process (e.g., a sandboxed browser renderer) could invoke Task Scheduler RPC methods, which run at medium integrity outside any AppContainer. Carefully crafted task registration or file path arguments provided a medium-IL code execution path from inside the AppContainer.
+
+**COM activation from sandbox processes:**
+
+AppContainers have a restricted capability set that limits which COM CLSIDs can be activated. However, certain COM servers registered with `AppID` entries that lack the `AccessPermission` restriction can be activated from AppContainer. Once activated, the COM server runs outside the AppContainer at a higher integrity level, and its methods provide a capability bridge.
+
+**WebDAV + AppContainer interaction:**
+
+WebDAV file access (`\\server@SSL\path\`) from inside an AppContainer triggers network I/O through the WebDAV client service (`WebClient`), which runs at medium IL. Certain path constructions cause the WebDAV client to perform file operations on behalf of the AppContainer process with medium-IL privileges, providing a write-outside-sandbox primitive.
+
+**Reading priority:** Important after ch03 (security model). AppContainer escapes are a prerequisite for browser/Office renderer exploit chains. Understanding which RPC and COM interfaces are accessible from AppContainer is an ongoing enumeration task.
+
+**Framework 5-question analysis:**
+
+1. *Class:* AppContainer sandbox escape — RPC interface accessible from AppContainer, COM activation privilege bridge, WebDAV medium-IL proxy
+2. *Discovery:* Enumeration of RPC endpoints + capability check analysis; COM CLSID activation testing from AppContainer context
+3. *Exploitation:* AppContainer → Task Scheduler RPC → medium-IL code execution; AppContainer → unrestricted COM server → capability bridge → medium-IL actions
+4. *Patch:* CVE-2024-49039 fixed. COM and WebDAV interaction issues addressed per case.
+5. *Generalization:* Methodology for AppContainer escape research: enumerate all named pipe and RPC endpoints reachable from AppContainer (use `NtObjectManager` + RPC endpoint enumeration). For each endpoint, test whether AppContainer SID is explicitly denied or only implicitly excluded. Implicit exclusion is weaker and more prone to misconfiguration.
+
+---
+
+### WTF: Snapshot-Based Coverage-Guided Kernel Fuzzing (2024 Update)
+**Speaker:** Axel Souchet (0vercl0k)
+**Conference:** HITB Singapore 2024
+**URL:** https://github.com/0vercl0k/wtf (project repository)
+**Reference:** Updated HITB presentation on WTF fuzzer; 2023–2024 case studies
+
+**What it introduced:**
+
+An updated presentation on the **WTF (What The Fuzz)** snapshot-based coverage-guided fuzzer, with new fuzzing modules for Windows kernel targets added in 2023–2024, and performance and stability improvements from production use.
+
+**New fuzzing modules documented in 2024:**
+
+- **NTFS fuzzing module:** Snapshots the kernel at the point of processing an NTFS `IRP_MJ_READ` or `IRP_MJ_CREATE` call. Mutates the on-disk NTFS structures (MFT records, attribute headers, B-tree nodes) and re-executes. Found multiple NTFS parsing bugs including out-of-bounds reads in attribute list traversal.
+- **ALPC fuzzing module:** Snapshots at `AlpcpReceiveMessage`; mutates the message buffer and attributes. Complements the TTD-based ALPC race methodology — TTD finds races, WTF fuzzing finds parsing and validation bugs in message handling.
+- **RPC fuzzing module:** Snapshots at the RPC dispatch layer; mutates NDR-encoded RPC call bodies. Effective for finding type confusion and integer overflow bugs in RPC server stubs.
+
+**Performance improvements:**
+
+WTF's snapshot restoration uses Hyper-V WHVP (Windows Hypervisor Platform) for VM-based snapshotting. The 2024 version improved snapshot restoration throughput from ~5,000 executions/second to ~15,000 executions/second for typical kernel targets by parallelizing dirty page tracking and reducing VM exit overhead.
+
+**Case studies from 2023–2024:**
+
+Documented fuzzing campaigns that found CVEs in the NTFS driver and in named pipe IRP handling — demonstrating that the fuzzer generates actionable findings on modern Windows 11 targets, not just older kernel versions.
+
+**Reading priority:** Required for ch12 (variant hunting). WTF is the most widely used snapshot fuzzer for Windows kernel research among public researchers. Understanding its module architecture is prerequisite to deploying it for a new subsystem target.
+
+**Framework 5-question analysis:**
+
+1. *Class:* Tool — snapshot-based coverage-guided fuzzer; finds multiple bug classes (OOB read/write, type confusion, integer overflow) in kernel parsing code
+2. *Discovery methodology:* Snapshot the kernel at a well-defined entry point → mutate inputs → measure coverage → guide mutation toward new code paths
+3. *Exploitation:* N/A (fuzzer, not exploit); findings require separate exploitation analysis
+4. *Patch:* Per-CVE for findings; the fuzzer continues finding new bugs
+5. *Generalization:* WTF module architecture: define a snapshot target (a function entry point), define input corpus (valid inputs to mutate from), define coverage instrumentation (basic block coverage via hardware PT or software instrumentation). Applicable to any kernel subsystem with a well-defined entry point.
+
+---
+
+### Pool Party Mitigations and What Came After
+**Speaker:** SafeBreach Labs researchers (Alon Leviev et al.)
+**Conference:** Black Hat USA 2024
+**Reference:** Pool Party original research (Black Hat USA 2023); 2024 follow-on mitigation analysis
+
+**What it introduced:**
+
+Analysis of the mitigations Microsoft deployed after Pool Party (2023) — which introduced thread pool worker exploitation as a new kernel primitive — and documentation of which mitigations are effective vs. bypassable, plus new exploitation approaches that work post-mitigation.
+
+**Pool Party recap (2023):**
+
+Pool Party discovered that Windows thread pool worker factories expose kernel objects whose worker thread callback pointers can be corrupted. If an attacker can write to a thread pool worker factory's callback field, they can redirect the next thread pool execution to an attacker-controlled function. Since thread pool workers run in kernel mode, this provides kernel code execution from a write primitive.
+
+**What mitigations were deployed:**
+
+- **Callback pointer integrity checks:** Microsoft added XFG (eXtended Flow Guard) annotations to some thread pool callback dispatch paths, checking that the target function is a valid XFG-protected call target.
+- **Object header hardening:** Pool object headers for certain worker factory types now include a tamper-detection field (similar to the I/O Ring `IORING_BUFFER_INFO` hash).
+
+**What still works post-mitigation:**
+
+- **Alternative worker factory types:** The mitigations were applied to specific worker factory object types. Worker factory variants using different internal structures were not covered, leaving functional bypass paths.
+- **Data-only thread pool manipulation:** Rather than overwriting the callback pointer (code pointer, protected by XFG), overwriting the argument passed to the callback. Certain thread pool configurations pass a pointer to a data structure as the callback argument; overwriting this structure's fields influences the callback's behavior without changing the code pointer itself.
+- **Detection signature evasion:** EDR products detect Pool Party via behavioral signatures (worker factory object handle acquisition from non-thread-pool threads, callback pointer writes within pool memory). Timing adjustments and using different API sequences avoid the specific behavioral patterns that trigger detection.
+
+**Reading priority:** Pair with "Windows Kernel Pool Exploitation 2024" entry above. Pool Party (2023) introduced the technique; this 2024 analysis documents the mitigation arms race. Together they give the current state of thread pool-based kernel exploitation.
+
+---
+
 ## Key Conference Venues
 
-| Venue | Focus | Archive |
-|-------|-------|---------|
-| Black Hat USA / Europe | Cutting-edge research; strong kernel and Windows track | https://www.blackhat.com/html/archives.html |
-| DEF CON | Wide range; many Windows LPE and exploitation talks | https://media.defcon.org/ |
-| BlueHat | Microsoft-organized; Windows-focused; mix of Microsoft engineers and external researchers | https://www.microsoft.com/en-us/msrc/bluehat-conference |
-| OffensiveCon | Exploitation-focused; high technical depth; predominantly Windows and Linux kernel | https://www.offensivecon.org/ |
-| REcon | Reverse engineering and internals deep dives; strong historical material | https://recon.cx/ |
-| Infiltrate | Exploitation methodology; more offensive focus; less widely archived | https://infiltratecon.com/ |
-| CONFidence | Central/Eastern European security conference; j00ru's variant hunting talks appeared here | https://confidence.org.pl/ |
-| OffensiveCon / BlueHat IL | Israeli BlueHat instance; j00ru's registry series started here | — |
+| Venue | Focus | Archive | 2024–2025 Windows Research Density |
+|-------|-------|---------|--------------------------------------|
+| Black Hat USA / Europe | Cutting-edge research; strong kernel and Windows track | https://www.blackhat.com/html/archives.html | High — Pool Party follow-on, Admin Protection, kernel exploitation |
+| DEF CON | Wide range; many Windows LPE and exploitation talks | https://media.defcon.org/ | High (DEF CON 32, 2024) — strong kernel exploitation content |
+| BlueHat | Microsoft-organized; Windows-focused; mix of Microsoft engineers and external researchers | https://www.microsoft.com/en-us/msrc/bluehat-conference | Medium-high — Microsoft-adjacent Windows research, BlueHat IL 2024 |
+| OffensiveCon | Exploitation-focused; high technical depth; predominantly Windows and Linux kernel | https://www.offensivecon.org/ | High (2024, Berlin) — excellent Windows internals coverage |
+| REcon | Reverse engineering and internals deep dives; strong historical material | https://recon.cx/ | Medium — hardware + kernel intersection, Recon Brussels 2024 |
+| Hexacon | Paris-based, strong Windows LPE focus, smaller venue | https://www.hexacon.fr/ | High (2024) — strong Windows LPE content, ALPC research |
+| Infiltrate | Exploitation methodology; more offensive focus; less widely archived | https://infiltratecon.com/ | Low-medium — conference cadence irregular |
+| CONFidence | Central/Eastern European security conference; j00ru's variant hunting talks appeared here | https://confidence.org.pl/ | Medium — j00ru registry series concluded here 2024 |
+| BlueHat IL | Israeli BlueHat instance; j00ru's registry series started here; AppContainer escape research | — | Medium — Microsoft-adjacent, AppContainer and sandbox research |
+| Hardwear.io | Hardware + firmware security; Windows intersection with hardware trust | https://hardwear.io/ | Low-medium — Admin Protection and TPM research 2024 |
 
 **Where to find archived talks:**
 
@@ -505,6 +770,15 @@ The limitations of PPL: a driver loaded at the right signer level can bypass PP/
 - DEF CON: https://media.defcon.org/ (free, full recordings)
 - REcon: https://recon.cx/ (most talks freely available post-conference)
 - j00ru's personal archive of all his talks: https://j00ru.vexillium.org/talks/ — the most complete source for Bochspwn and registry series materials
+
+**2024–2025 venue highlights:**
+
+- **DEF CON 32 (2024):** Strong kernel exploitation content including pool exploitation state-of-the-art and kernel primitive updates.
+- **Black Hat USA 2024:** Pool Party follow-on (SafeBreach), Administrator Protection attack surface, kernel exploitation post-mitigation.
+- **Hexacon 2024 (Paris):** Strongest single-venue Windows LPE content in 2024 — ALPC races, registry variants, LPE methodology.
+- **OffensiveCon 2024 (Berlin):** Excellent Windows internals coverage — COM security, AppContainer escapes, driver exploitation.
+- **Recon Brussels 2024:** Hardware + kernel intersection, UEFI/firmware + Windows boot chain research.
+- **BlueHat IL 2024:** Microsoft-adjacent Windows research — AppContainer, sandbox escapes, Administrator Protection preview.
 
 ---
 
@@ -531,6 +805,21 @@ Each Project Zero issue report is a mini-paper: root cause analysis, reproductio
 
 The issue tracker is also a leading indicator: issues are made public 90 days after disclosure even without a patch. Checking the tracker weekly gives access to vulnerability details ~90 days before the blog posts appear.
 
+### FudModule Technical Report — AhnLab / ANSSI Joint Whitepaper (February 2024)
+**Reference:** "Analysis of Lazarus Group's FudModule v2 Rootkit" — AhnLab ASEC / ANSSI (February 2024)
+
+Joint technical whitepaper from Korean CERT (AhnLab) and French national cybersecurity agency (ANSSI) documenting the FudModule v2 rootkit in detail. Covers the `appid.sys` IOCTL vulnerability, the kernel callback table overwrite technique, the rootkit's anti-forensic behaviors, and the broader Lazarus Group infrastructure.
+
+Distinct from the conference talks — the whitepaper includes binary analysis, IOCs, and a more complete description of the exploit chain than the conference presentations. Read the whitepaper for technical depth; read the conference talk write-up for methodology extraction.
+
+### "Systematic Analysis of Windows Kernel Security Mechanisms" — IEEE S&P 2024
+Academic treatment of the interaction between multiple Windows kernel security mechanisms (KASLR, SMEP, SMAP, HVCI, VBS) — analyzing which combinations of mechanisms provide meaningful security guarantees and which leave exploitable gaps. Particularly relevant for understanding why HVCI + Secure Boot does not prevent data-only attacks (FudModule), and why KASLR alone is insufficient against local privilege escalation (any kernel infoleak defeats it).
+
+### VBS/HVCI Security Analysis — Bromium / VMware Research
+Analysis of the Virtualization-Based Security (VBS) and Hypervisor-Protected Code Integrity (HVCI) implementation. Covers: how VTL0 (normal world) and VTL1 (secure world) are isolated, what HVCI actually protects (executable pages must be signed; unsigned code cannot execute in kernel mode), what it explicitly does not protect (kernel data structures, MMIO regions, DMA), and known VTL boundary research from 2022–2024.
+
+Essential background for understanding the limits of HVCI-based protection and why data-only attacks (FudModule) are not blocked by it.
+
 ---
 
 ## Cross-Talk Reading Order
@@ -538,28 +827,67 @@ The issue tracker is also a leading indicator: issues are made public 90 days af
 For a researcher building toward kernel exploitation capability, the talks have natural dependencies:
 
 ```
-Mandt DEF CON 19 (2011)          ← understand NT pool architecture
-    ↓
-Pool Is Dead (Shafir/Ionescu)    ← understand what changed and why
-    ↓
-j00ru "Decade of LPE" (2016)    ← understand mitigation timeline
-    ↓
-I/O Ring primitive (Shafir)     ← understand current exploitation technique
+Mandt DEF CON 19 (2011)          <- understand NT pool architecture
+    |
+    v
+Pool Is Dead (Shafir/Ionescu)    <- understand what changed and why
+    |
+    v
+j00ru "Decade of LPE" (2016)    <- understand mitigation timeline
+    |
+    v
+I/O Ring primitive (Shafir)     <- understand current exploitation technique
 
-Bochspwn (j00ru, 2013)          ← understand tool-driven class discovery
-    ↓
-Bochspwn Reloaded (2017)        ← taint tracking extension
-    ↓
-Bochspwn Revolutions (2018)     ← false positive reduction engineering
-    ↓
-Registry series (2023–2024)     ← subsystem-level feature interaction methodology
+Bochspwn (j00ru, 2013)          <- understand tool-driven class discovery
+    |
+    v
+Bochspwn Reloaded (2017)        <- taint tracking extension
+    |
+    v
+Bochspwn Revolutions (2018)     <- false positive reduction engineering
+    |
+    v
+Registry series (2023-2024)     <- subsystem-level feature interaction methodology
 
-Forshaw DEF CON 25 (2017)       ← object namespace attack surface
-    ↓
-Windows Exploitation Tricks (2018) ← file write exploitation chains
+Forshaw DEF CON 25 (2017)       <- object namespace attack surface
+    |
+    v
+Windows Exploitation Tricks (2018) <- file write exploitation chains
 ```
 
 The Bochspwn series and the Forshaw series are independent tracks. The pool track is a prerequisite for the I/O Ring primitive.
+
+**2024 content path — kernel exploitation + APT tradecraft:**
+
+```
+ch01 (Windows fundamentals)
+    |
+    v
+ch03 (security model, tokens, integrity levels)
+    |
+    v
+ch10 (kernel internals, pool, primitives)
+    |
+    v
+[Read FudModule AhnLab/ANSSI whitepaper]   <- data-only kernel attack
+    |
+    v
+ch04 (driver exploitation)
+    |
+    v
+ch05 (RPC/COM/ALPC)
+    |
+    v
+[Read COM-Back: Forshaw P0 2025]           <- COM activation security
+    |
+    v
+ch09 (variant hunting methodology)
+    |
+    v
+ch12 (fuzzing and automated discovery)
+```
+
+This path connects the foundational kernel knowledge (ch01, ch03, ch10) through the advanced APT exploitation case study (FudModule), into the driver and IPC attack surfaces (ch04, ch05), and concludes with the research methodology for discovering new bugs in the same classes (ch09, ch12).
 
 ---
 
@@ -582,3 +910,12 @@ The Bochspwn series and the Forshaw series are independent tracks. The pool trac
 - [R-15] Project Zero Issue Tracker (Windows) — https://bugs.chromium.org/p/project-zero/issues/list?q=windows
 - [R-16] Kernel Pool Exploitation on Windows 7 — Tarjei Mandt — DEF CON 19 (2011)
 - [R-17] Phrack archives — http://phrack.org/
+- [R-18] FudModule Technical Report — AhnLab ASEC / ANSSI — February 2024
+- [R-19] The COM-Back: Revisiting COM Activation Security — James Forshaw / Project Zero — January 2025
+- [R-20] Administrator Protection Attack and Defense — OffensiveCon / Hardwear.io 2024
+- [R-21] Windows Kernel Pool Exploitation 2024 — DEF CON 32 / Black Hat USA 2024
+- [R-22] ALPC Race Conditions — Hexacon 2024; CVE-2024-30088, CVE-2025-21418
+- [R-23] Breaking Out of AppContainers in 2024 — BlueHat IL / OffensiveCon 2024; CVE-2024-49039
+- [R-24] WTF Snapshot Fuzzer 2024 — Axel Souchet — HITB Singapore 2024 — https://github.com/0vercl0k/wtf
+- [R-25] Pool Party Mitigations and What Came After — SafeBreach Labs / Black Hat USA 2024
+- [R-26] Hexacon 2024 proceedings — https://www.hexacon.fr/

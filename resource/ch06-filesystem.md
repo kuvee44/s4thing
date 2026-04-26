@@ -4,8 +4,8 @@
 > Topics include NTFS on-disk architecture, file operation security semantics, reparse points
 > and link types at the kernel level, hard link security implications, opportunistic lock
 > mechanics and exploitation, the BaitAndSwitch TOCTOU pattern, the canonical arbitrary-file-write
-> to LPE chain, NTFS transactions (TxF), and minifilter driver architecture as an EDR bypass
-> surface.
+> to LPE chain, NTFS transactions (TxF), minifilter driver architecture as an EDR bypass
+> surface, recent filesystem CVEs (2024-2025), and Windows 11 24H2 filesystem hardening.
 
 ---
 
@@ -265,9 +265,13 @@ typedef struct _REPARSE_DATA_BUFFER {
 | `0xA000000C` | `IO_REPARSE_TAG_SYMLINK` | NTFS symbolic link | Requires privilege; cross-volume capable |
 | `0xA0000003` | `IO_REPARSE_TAG_MOUNT_POINT` | Junction / mount point | No privilege required; directory-level redirect |
 | `0x80000017` | `IO_REPARSE_TAG_CLOUD` | OneDrive stub | Traversal behavior depends on cloud provider filter |
-| `0x8000001A` | `IO_REPARSE_TAG_APPEXECLINK` | App execution alias | Explorable for UWP bypass |
-| `0x80000023` | `IO_REPARSE_TAG_LX_SYMLINK` | WSL symlink | WSL filesystem boundary |
-| `0x8000001E` | `IO_REPARSE_TAG_WCI` | WCI container layer | Windows Container isolation |
+| `0x8000001A` | `IO_REPARSE_TAG_APPEXECLINK` | App execution alias | UWP app alias — abuse for path traversal (see 3.5) |
+| `0x80000023` | `IO_REPARSE_TAG_LX_SYMLINK` | WSL symlink | WSL filesystem boundary; cross-FS attack surface |
+| `0x80000025` | `IO_REPARSE_TAG_LX_FIFO` | WSL FIFO | WSL special file |
+| `0x80000026` | `IO_REPARSE_TAG_LX_CHR` | WSL char device | WSL special file |
+| `0x80000027` | `IO_REPARSE_TAG_LX_BLK` | WSL block device | WSL special file |
+| `0x8000001E` | `IO_REPARSE_TAG_WCI` | WCI container layer | Windows Container isolation — escape research 2024 |
+| `0x80000030` | `IO_REPARSE_TAG_AF_UNIX` | AF_UNIX socket (WSL2) | New in Win11; cross-namespace boundary |
 
 **Third-party cloud storage tags:** Cloud provider reparse points (`IO_REPARSE_TAG_CLOUD_*`)
 are processed by vendor minifilter drivers, not by NTFS directly. These drivers implement
@@ -279,11 +283,11 @@ reparse handling. Investigating third-party reparse traversal is an underexplore
 | Feature | NTFS Junction | NTFS File Symlink | Object Manager Symlink | Hard Link |
 |---|---|---|---|---|
 | **Target scope** | Directory only | File or directory | Any named object | File only |
-| **Cross-volume** | ❌ Same volume | ✅ Yes | ✅ Yes | ❌ Same volume |
+| **Cross-volume** | No — same volume | Yes | Yes | No — same volume |
 | **Privilege required** | None (own directory) | `SeCreateSymbolicLinkPrivilege` or Developer Mode | None (if target dir allows) | Write access to directory |
-| **NTFS layer** | ✅ $REPARSE_POINT attr | ✅ $REPARSE_POINT attr | ❌ Object Manager only | ✅ $FILE_NAME attr |
-| **OBJ_DONT_REPARSE blocks** | ✅ Yes | ✅ Yes | ❌ No (pre-NTFS) | N/A |
-| **Win32 path visible** | ✅ Yes | ✅ Yes | ✅ Via `\\?\` path | ✅ Yes |
+| **NTFS layer** | Yes — $REPARSE_POINT attr | Yes — $REPARSE_POINT attr | No — Object Manager only | Yes — $FILE_NAME attr |
+| **OBJ_DONT_REPARSE blocks** | Yes | Yes | No (pre-NTFS) | N/A |
+| **Win32 path visible** | Yes | Yes | Yes via `\\?\` path | Yes |
 | **Absolute or relative** | Absolute NT path only | Both | Both | N/A |
 
 **Attack design guidance:**
@@ -332,6 +336,159 @@ DeviceIoControl(hDir, FSCTL_DELETE_REPARSE_POINT, ...);
 which automates junction creation with proper NT path formatting. The tool handles the
 `\??\` prefix correctly and can create junctions to non-existent target paths (useful for
 staging the attack before the target is set up).
+
+### 3.5 AppExecLink Reparse Points — UWP Alias Abuse (2024)
+
+`IO_REPARSE_TAG_APPEXECLINK` (`0x8000001A`) is used by UWP app execution aliases: stub
+executables placed at `%LOCALAPPDATA%\Microsoft\WindowsApps\<appname>.exe` that redirect
+launches to the actual packaged app via the Desktop App Broker. The reparse data contains
+the Package Family Name, Application ID, and target path.
+
+**Structure of AppExecLink reparse data:**
+```c
+// AppExecLink reparse buffer layout (undocumented)
+// Offset 0x00: ULONG  Version (always 3)
+// Offset 0x04: WCHAR  Payload[] — four null-separated Unicode strings:
+//   [0] Package Family Name  e.g. "Microsoft.WindowsTerminal_8wekyb3d8bbwe"
+//   [1] Application ID       e.g. "App"
+//   [2] Target executable    e.g. "C:\Program Files\WindowsApps\...\wt.exe"
+//   [3] Empty string
+```
+
+**Attack surface: path traversal via AppExecLink in world-writable directory**
+
+The `%LOCALAPPDATA%\Microsoft\WindowsApps\` directory is user-writable. A user can create
+a crafted AppExecLink reparse point there. If a privileged process (e.g., installer, update
+service) enumerates files in this path and processes them based on the reparse data without
+validating the package signature, the attacker-controlled target path in field [2] can
+redirect execution.
+
+```c
+// Reading AppExecLink reparse buffer to extract target path
+HANDLE hFile = CreateFile(aliasPath,
+    GENERIC_READ,
+    FILE_SHARE_READ | FILE_SHARE_WRITE,
+    NULL, OPEN_EXISTING,
+    FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, NULL);
+
+BYTE buf[4096];
+DWORD dwBytesReturned;
+DeviceIoControl(hFile, FSCTL_GET_REPARSE_POINT, NULL, 0,
+    buf, sizeof(buf), &dwBytesReturned, NULL);
+
+REPARSE_DATA_BUFFER *rdb = (REPARSE_DATA_BUFFER *)buf;
+// rdb->ReparseTag == IO_REPARSE_TAG_APPEXECLINK (0x8000001A)
+// Walk the null-separated strings in GenericReparseBuffer.DataBuffer
+// to extract target path
+```
+
+**Research checklist for AppExecLink abuse:**
+1. Identify processes that read `WindowsApps\` path (ProcMon filter: `Path contains WindowsApps`)
+2. Check whether the reading process validates Package Family Name against the AppX manifest
+3. If target path from reparse data is used without validation → arbitrary execution primitive
+
+### 3.6 WSL Reparse Points and Cross-FS Symlink Attacks (Windows 11)
+
+Windows 11 introduced new reparse tags for WSL2 integration:
+
+| Tag | Constant | Purpose |
+|-----|----------|---------|
+| `0x80000023` | `IO_REPARSE_TAG_LX_SYMLINK` | WSL symlink (target stored in reparse data) |
+| `0x80000025` | `IO_REPARSE_TAG_LX_FIFO` | WSL named pipe |
+| `0x80000026` | `IO_REPARSE_TAG_LX_CHR` | WSL character device |
+| `0x80000027` | `IO_REPARSE_TAG_LX_BLK` | WSL block device |
+| `0x80000030` | `IO_REPARSE_TAG_AF_UNIX` | AF_UNIX socket for WSL2↔Win32 IPC |
+
+**Cross-FS symlink attack scenario:**
+
+WSL symlinks (`IO_REPARSE_TAG_LX_SYMLINK`) are created by the WSL filesystem driver
+(`lxcore.sys`). When accessed from the Windows NT path namespace, the kernel sees a
+reparse point with an unrecognized tag (from the NT perspective). The behavior depends
+on whether the accessing process opens with `FILE_FLAG_OPEN_REPARSE_POINT`:
+
+```
+Scenario: WSL symlink at C:\Users\user\AppData\Local\Packages\<WSL>\...\rootfs\tmp\link
+  → Target: /etc/shadow (absolute WSL path)
+
+Windows process opens without FILE_FLAG_OPEN_REPARSE_POINT:
+  → lxcore.sys intercepts, resolves within WSL VFS namespace
+  → Returns WSL file content to Windows process
+  → Windows process may not expect to receive /etc/shadow content
+
+Attack relevance:
+  → A privileged Windows process that copies files from a WSL rootfs path
+     without FILE_FLAG_OPEN_REPARSE_POINT can be redirected via WSL symlinks
+     to read arbitrary files within the WSL namespace
+```
+
+**Auditing WSL reparse points on a live system:**
+```powershell
+# Find WSL-created reparse points under a path
+Get-ChildItem -Path "C:\Users\$env:USERNAME\AppData\Local\Packages" -Recurse -Force |
+    Where-Object { $_.Attributes -band [System.IO.FileAttributes]::ReparsePoint } |
+    Select-Object FullName, Attributes
+```
+
+```windbg
+; In kernel debugger — examine LX_SYMLINK reparse buffer
+; dt lxcore!_LX_SYMLINK_REPARSE_BUFFER <address>
+; The target path is stored as a UTF-8 byte array in the reparse data
+```
+
+### 3.7 WCI (Windows Container Isolation) Filter Reparse Points — Escape Research 2024
+
+Windows Container Isolation (`wcifs.sys`) implements the container filesystem layer using
+`IO_REPARSE_TAG_WCI` (`0x8000001E`) and related tags. WCI provides copy-on-write semantics
+for container images: files in the base image appear in the container via reparse points;
+writes go to a per-container scratch layer.
+
+**WCI tag family:**
+```
+IO_REPARSE_TAG_WCI         0x8000001E  — main WCI reparse tag
+IO_REPARSE_TAG_WCI_1       0x9000001E  — variant
+IO_REPARSE_TAG_WCI_LINK    0xA000001E  — hard link variant
+IO_REPARSE_TAG_WCI_TOMBSTONE 0xA000001F — deleted file marker
+```
+
+**Container escape research surface (2024):**
+
+The WCI filter driver processes reparse points to serve base-image files to the container
+namespace. Attack vectors being researched:
+
+1. **Crafted WCI reparse buffer:** If a low-privilege process inside the container can write
+   a crafted `IO_REPARSE_TAG_WCI` reparse point, and the host-side WCI filter driver follows
+   it without proper privilege validation, the path resolution can escape the container
+   scratch layer into the host filesystem.
+
+2. **TOCTOU in WCI layer stack-up:** WCI layers can be stacked (multiple base image layers
+   merged). A race condition between layer resolution and file content delivery could allow
+   container code to read files from a different container's scratch layer.
+
+3. **WCI + junction chaining:** A WCI reparse point that resolves to a directory containing
+   an NTFS junction can create a two-hop traversal that escapes the container filesystem
+   boundary.
+
+```c
+// Reading WCI reparse data from inside a container (research purposes)
+// The WCI reparse buffer contains:
+//   ULONG  Version
+//   GUID   LayerIdentifier  (identifies which base image layer)
+//   ULONG  Flags
+//   WCHAR  FilePath[]       (path within the base image layer)
+
+// Auditing: compare ReparseTag of container files against expected WCI tags
+HANDLE hDir = CreateFile(containerPath,
+    GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
+    FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, NULL);
+DeviceIoControl(hDir, FSCTL_GET_REPARSE_POINT, NULL, 0,
+    buf, sizeof(buf), &dwBytes, NULL);
+// Inspect ReparseTag — unexpected tags in container path may indicate escape
+```
+
+**References for WCI escape research:**
+- `wcifs.sys` symbols available from Microsoft symbol server
+- Check WCI filter altitude (around 180451) and its pre-create callback logic
+- `!fltkd.filter` in WinDbg on a Hyper-V host with containers running
 
 ---
 
@@ -520,6 +677,104 @@ the first check in code review.
 ProcMon's minifilter driver (`PROCMON24.SYS`) opens files to record access — this can
 trigger oplock breaks prematurely during testing. Disable ProcMon or use kernel debugging
 instead.
+
+### 5.5 Oplock Filter Key Abuse — CVE-2024-21338 Indirect Usage
+
+CVE-2024-21338 was a Windows kernel EoP exploited in the wild (attributed to Lazarus Group,
+February 2024). While the primary bug was in `appid.sys` (AppLocker's kernel driver), the
+exploitation mechanism involved a crafted IOCTL to manipulate kernel callback structures.
+The oplock connection is indirect: the exploit used file I/O timing to trigger the vulnerable
+code path at a precise moment.
+
+**Oplock filter key** (`FilterKey` field in `FSCTL_REQUEST_OPLOCK`) is an opaque 64-bit value
+the caller sets when requesting an oplock. It is echoed back in the break notification, allowing
+multi-threaded oplock managers to correlate notifications with outstanding requests. In
+server-side implementations (SMB, etc.), the filter key maps to a specific client connection.
+
+**Abuse pattern:**
+If a kernel component accepts a filter key from user mode without validation and uses it
+to look up a structure (e.g., a linked list of per-connection contexts), a crafted filter
+key value can be used for:
+- Out-of-bounds read (treating the key as a pointer offset)
+- Type confusion (if the key is cast to a pointer type)
+
+Audit target: drivers that call `FsRtlCheckOplockEx2()` or `FsRtlOplockBreakToNone()` with
+user-supplied filter key parameters.
+
+```c
+// Kernel-side filter key in oplock break notification
+typedef struct _OPLOCK_NOTIFY_INFO {
+    ULONG64 FilterKey;          // echoed from the requestor — validate this!
+    // ... other fields
+} OPLOCK_NOTIFY_INFO;
+```
+
+### 5.6 OplockUpgradedToLevel1 Race — New Variant (2024)
+
+A Level 2 oplock (shared read, multiple holders allowed) can be upgraded to Level 1
+(exclusive) when one holder requests exclusivity. The upgrade sequence:
+
+```
+State: File has Level 2 oplocks held by processes A and B
+  Process A requests upgrade to Level 1:
+    → Kernel sends break notification to ALL Level 2 holders
+    → Each holder must acknowledge (release) before upgrade completes
+    → Process A is blocked until all Level 2 holders ack
+
+Race window during upgrade acknowledgment:
+  Between B's ack (Level 2 released) and A's Level 1 grant:
+  → File has NO oplock for a brief interval
+  → A third process C can acquire a new Level 2 oplock
+  → This resets the upgrade countdown
+  → With repeated C openings, A can be indefinitely starved
+```
+
+**Security implication:** A service that holds a Level 1 oplock to protect a TOCTOU
+window can be denied the upgrade if an attacker repeatedly opens the file with Level 2
+compatible access, preventing the service from completing its protected operation.
+
+**New kernel API surface:** `FsRtlRequestOplockUpgradeToLevel1()` was added in recent
+Windows builds to handle upgrade-to-Level1 atomically with reduced race exposure. Minifilter
+drivers that intercept oplock upgrades must handle the new `IRP_MN_OPLOCK_UPGRADE` minor
+function code.
+
+```c
+// New API — available in WDK for Windows 11 24H2+
+NTSTATUS FsRtlRequestOplockUpgradeToLevel1(
+    POPLOCK Oplock,
+    PIRP    Irp,
+    ULONG   Flags   // OPLOCK_UPGRADE_FLAG_ALLOW_SUBORDINATE
+);
+// Callers: NTFS.sys, ReFS.sys; relevant for filter drivers that wrap oplock FSCTLs
+```
+
+### 5.7 Server-Side Oplock Implications for SMB-Based Attacks
+
+SMB protocol maps client caching requests (SMB2 Lease / legacy SMB oplock) to server-side
+NTFS oplocks. This creates cross-machine TOCTOU opportunities:
+
+```
+Attack scenario: SMB share with a writable directory
+
+1. Attacker client opens \\server\share\bait.txt with SMB2 Lease (Read+Handle cache)
+   → Server-side NTFS oplock: OPLOCK_LEVEL_CACHE_READ | OPLOCK_LEVEL_CACHE_HANDLE
+
+2. Victim client (privileged, on same machine as server) opens bait.txt for write
+   → Server-side oplock break fires
+   → Victim's open is suspended on the server (NtCreateFile blocked in NTFS)
+
+3. Attacker receives Lease Break notification over SMB connection
+   → Network round-trip gives attacker ~10ms to manipulate the share path
+   → Attacker replaces bait.txt content or directory structure via a second connection
+
+4. Attacker sends Lease Break Acknowledgment
+   → Victim's suspended open resumes with new file content
+```
+
+**Mitigation research:** Server-side oplocks are issued at the NTFS layer; the
+`srv2.sys` minifilter mediates between SMB client cache requests and NTFS oplock state.
+Investigating whether `srv2.sys` applies `OBJ_DONT_REPARSE` equivalent protections when
+converting lease breaks to junction traversals is an open research question.
 
 ---
 
@@ -838,14 +1093,195 @@ connect and inject malformed messages, potentially influencing filter behavior.
 
 | Access Technique | Minifilter visibility | ETW visibility | Notes |
 |---|---|---|---|
-| Normal `CreateFile` | ✅ Full | ✅ Full | Standard path, fully monitored |
-| `ZwCreateFile` from user mode | ✅ Full | ✅ Full | Same as CreateFile at driver level |
-| `ZwCreateFile` from kernel (KernelMode) | ⚠️ Partial | ✅ ETW kernel | PreviousMode affects some checks |
-| Direct volume device I/O | ❌ None | ⚠️ May appear as volume read | Raw sector access, no file semantics |
-| Volume GUID path | ⚠️ May bypass path rules | ✅ Full | Filter sees IRP but may not match policy |
-| Transacted I/O (TxF) | ⚠️ Depends on filter version | ⚠️ Partial | Older filters may miss |
-| ADS access | ✅ Full (if filter checks streams) | ✅ Full | Filter must check StreamContext |
-| Kernel driver below filter altitude | ❌ None | ✅ ETW kernel | Requires kernel driver |
+| Normal `CreateFile` | Full | Full | Standard path, fully monitored |
+| `ZwCreateFile` from user mode | Full | Full | Same as CreateFile at driver level |
+| `ZwCreateFile` from kernel (KernelMode) | Partial | ETW kernel | PreviousMode affects some checks |
+| Direct volume device I/O | None | May appear as volume read | Raw sector access, no file semantics |
+| Volume GUID path | May bypass path rules | Full | Filter sees IRP but may not match policy |
+| Transacted I/O (TxF) | Depends on filter version | Partial | Older filters may miss |
+| ADS access | Full (if filter checks streams) | Full | Filter must check StreamContext |
+| Kernel driver below filter altitude | None | ETW kernel | Requires kernel driver |
+
+### 9.5 FltRegisterFilter + Callback Unhooking (Post-PPL Era, 2024)
+
+In the post-PPL (Protected Process Light) era, EDR vendors moved their most critical
+callbacks into PPL processes, making it harder to patch them from user mode. However,
+the minifilter callback table itself (`FLT_OPERATION_REGISTRATION` array) lives in the
+driver's data section in kernel memory.
+
+**Technique: Minifilter pre-op callback NOP-out**
+
+A kernel driver can locate a target minifilter's `FLT_FILTER` structure and overwrite
+its callback pointers:
+
+```c
+// Kernel-mode research code — finding a minifilter's callbacks
+// 1. Call FltEnumerateFilters() to get filter handles
+// 2. For each filter, cast to internal FLT_FILTER structure
+// 3. Locate the Operations array (FLT_OPERATION_REGISTRATION*)
+// 4. For each operation of interest, overwrite PreOperation/PostOperation
+
+// Internal FLT_FILTER layout (from ntifs.h reverse engineering):
+typedef struct _FLT_FILTER {
+    FLT_OBJECT          Base;
+    PFLT_FILTER_UNLOAD_CALLBACK  FilterUnload;
+    PFLT_INSTANCE_SETUP_CALLBACK InstanceSetup;
+    // ... other fields
+    PFLT_OPERATION_REGISTRATION  Operations;  // callback table
+    // ...
+} FLT_FILTER, *PFLT_FILTER;
+
+// Overwriting the IRP_MJ_CREATE pre-op callback with a passthrough:
+filter->Operations[0].PreOperation = NULL;  // disable pre-create callback
+```
+
+**Detection:** PatchGuard (KPP) does not protect minifilter callback tables — it protects
+SSDT, IDT, and MSRs. Minifilter unhooking is therefore not directly blocked by KPP.
+Detection relies on periodic integrity verification of filter callback pointers by the
+EDR's own watchdog thread or by a separate watchdog filter.
+
+**ELAM (Early Launch Anti-Malware) bypass research:**
+
+ELAM drivers (`WdBoot.sys` for Windows Defender) are loaded very early in boot before
+most third-party drivers. ELAM registers a minifilter at a special protected altitude
+(around `385200` for `WdFilter.sys`). To bypass ELAM-registered callbacks:
+
+1. Understand ELAM's measurement policy (stored in the ELAM resource section of the driver
+   image — readable from the PE before the driver loads)
+2. ELAM's callback can be defeated if the attacker loads a driver that calls
+   `FltUnregisterFilter` on the ELAM filter object — but this requires kernel code execution
+   first, which is chicken-and-egg for most bypass scenarios.
+3. More practical: ELAM only measures boot drivers. A user-mode bypass that avoids
+   triggering minifilter callbacks (e.g., direct volume I/O) sidesteps ELAM monitoring
+   without needing to unregister the ELAM filter.
+
+```windbg
+; Find ELAM/WdFilter altitude and callbacks
+!fltkd.filters
+; Look for altitude 385200 (WdFilter) or the ELAM-registered filter
+; Compare reported callbacks with expected values from symbols
+```
+
+### 9.6 CVE-2024-30030 — WER Symlink + Minifilter Interaction
+
+**CVE-2024-30030** (patched May 2024, CVSS 7.8) is a Windows Error Reporting (WER)
+privilege escalation that exploits the interaction between WER's SYSTEM-context file
+creation and NTFS symbolic link processing, with a minifilter callback race.
+
+**Vulnerability chain:**
+```
+1. Windows Error Reporting Service (WerSvc) runs as NETWORK SERVICE
+   but escalates to SYSTEM for writing crash dump files
+
+2. WER creates crash dump at predictable path:
+   C:\ProgramData\Microsoft\Windows\WER\ReportQueue\<GUID>\<process>.dmp
+
+3. The directory C:\ProgramData\Microsoft\Windows\WER\ReportQueue\
+   has weak ACLs — normal users can create subdirectories
+
+4. Attack:
+   a. Attacker creates C:\ProgramData\Microsoft\Windows\WER\ReportQueue\<crafted-GUID>\
+   b. Places NTFS junction or symlink pointing to a privileged path
+   c. Triggers a crash in a SYSTEM process (or a process WER monitors)
+   d. WER writes dump to the symlink target → arbitrary file write as SYSTEM
+
+5. Minifilter interaction:
+   - Some EDR minifilters opened WER temp files to scan them
+   - The EDR's pre-create callback ran under WER's SYSTEM security context
+   - If the EDR followed the symlink without OBJ_DONT_REPARSE, the EDR itself
+     performed a SYSTEM-context open on the attacker's redirect target
+   - This extended the attack surface to the EDR's own file monitoring logic
+```
+
+**Patch analysis:** Microsoft patched `wer.dll` and `wersvc.dll` to use
+`OBJ_DONT_REPARSE` when creating report directories and applying more restrictive
+DACLs to the ReportQueue directory. Post-patch diff shows addition of
+`OBJ_DONT_REPARSE` flag in the ObjectAttributes initialization before `NtCreateFile`
+calls in the WER dump writing code path.
+
+### 9.7 ETW-Based Minifilter Monitoring
+
+ETW (Event Tracing for Windows) provides visibility into filesystem activity independent
+of minifilter callbacks — useful for detecting minifilter bypass techniques.
+
+**Key ETW providers for filesystem research:**
+
+| Provider | GUID | Events |
+|----------|------|--------|
+| `Microsoft-Windows-NTFS` | `{DD70BC80-EF44-421B-8AC3-CD31DA613A4E}` | File create, delete, rename, reparse |
+| `Microsoft-Windows-Kernel-File` | `{EDD08927-9CC4-4E65-B970-C2560FB5C289}` | High-level file I/O |
+| `Microsoft-Windows-StorPort` | `{C4636A1E-7986-4646-BF10-7BC3B4A76E8E}` | Storage I/O at port level |
+| `Microsoft-Windows-FilterManager` | `{F3C5E28E-63F6-49C7-A204-E48A1BC4B09D}` | Minifilter load/unload events |
+
+```powershell
+# Start ETW session for NTFS file operations
+$session = New-EtwTraceSession -Name "FileSec" -LogFileMode 0x8000000
+Add-EtwTraceProvider -SessionName "FileSec" `
+    -Guid "{DD70BC80-EF44-421B-8AC3-CD31DA613A4E}" `
+    -Level 5 -MatchAnyKeyword 0xFFFFFFFF
+Start-EtwTraceSession -Name "FileSec"
+
+# For raw ETW capture and analysis:
+# xperf -on NTFS+FileIO+FileIOInit -stackwalk FileCreate
+# xperf -d trace.etl
+# xperf -i trace.etl -o report.txt -a fileio
+```
+
+**Detecting minifilter unregistration via ETW:**
+The `Microsoft-Windows-FilterManager` provider emits events when a minifilter is
+unregistered (event ID 3 = `FltUnregisterFilter`). Monitoring for unexpected
+unregistration events at runtime is a defense-in-depth strategy for detecting
+callback unhooking.
+
+### 9.8 Sealighter-TI + Minifilter Combined Analysis Workflow
+
+[Sealighter-TI](https://github.com/pathtofile/SealighterTI) is a ThreatIntel provider
+that bridges ETW events from high-privilege providers (including kernel-mode providers)
+to user-mode analysis tools without requiring a kernel driver.
+
+**Combined workflow for minifilter research:**
+
+```
+Step 1: Run Sealighter-TI to capture Microsoft-Windows-NTFS events
+  sealighter.exe -config sealighter_config.json
+  # config specifies: provider GUID, keywords, output format (JSON)
+
+Step 2: Simultaneously run a second ETW session on Microsoft-Windows-FilterManager
+  # Captures filter load/unload events
+
+Step 3: Correlate events:
+  - NTFS "FileCreate" event with no corresponding FilterManager pre-create callback
+    → Indicates I/O path bypassed minifilter stack
+  - FilterManager "FilterUnregistered" event during active I/O
+    → Indicates possible callback unhooking attack
+
+Step 4: Cross-reference with WinDbg kernel state:
+  !fltkd.filters      ← compare loaded filters with ETW filter list
+  !fltkd.volumes      ← verify filter instances per volume
+```
+
+**Sample Sealighter config for filesystem monitoring:**
+```json
+{
+  "session_name": "FilesystemResearch",
+  "output_format": "stdout",
+  "providers": [
+    {
+      "name": "Microsoft-Windows-NTFS",
+      "keywords_any": "0xFFFFFFFFFFFFFFFF",
+      "level": 5,
+      "filters": [
+        { "filter_type": "process_name", "filter": "svchost.exe" }
+      ]
+    },
+    {
+      "name": "Microsoft-Windows-FilterManager",
+      "keywords_any": "0xFFFFFFFFFFFFFFFF",
+      "level": 5
+    }
+  ]
+}
+```
 
 ---
 
@@ -934,6 +1370,286 @@ dt NTFS!_FCB <address>          ; File Control Block
 ; No direct WinDbg extension; look at FCB->Oplock
 dt NTFS!_FCB <addr> Oplock
 dt nt!_OPLOCK <addr>            ; oplock state machine
+
+; ─── MINIFILTER CALLBACK INSPECTION (2024 additions) ─────────────────
+; Find FLT_FILTER object for a specific driver:
+!fltkd.filter <addr>            ; shows Operations array address
+; Then walk the FLT_OPERATION_REGISTRATION array:
+dt FltMgr!_FLT_OPERATION_REGISTRATION <ops_addr>
+; Check PreOperation and PostOperation function pointers
+
+; ─── ETW TRACE FROM KERNEL (Sealighter-TI complement) ─────────────────
+; Verify active ETW sessions:
+!wmitrace.strdump               ; dump all WMI/ETW trace sessions
+!wmitrace.logger                ; list active loggers
+```
+
+---
+
+## 12. Recent Filesystem Vulnerabilities (2024-2025)
+
+### 12.1 CVE Summary Table
+
+| CVE | Component | Type | Impact | Patch Date |
+|-----|-----------|------|--------|------------|
+| CVE-2024-26185 | NTFS (`ntfs.sys`) | Compression parsing — arbitrary write | SYSTEM LPE | March 2024 |
+| CVE-2024-21446 | NTFS (`ntfs.sys`) | Privilege escalation (unspecified path) | SYSTEM LPE | April 2024 |
+| CVE-2024-30030 | WER + NTFS | Symlink race + arbitrary file write | SYSTEM LPE | May 2024 |
+| CVE-2025-21333 | Hyper-V NTFS integration (`ntfs.sys` on host) | In-the-wild exploitation | SYSTEM LPE | January 2025 |
+| CVE-2024-38100 | Windows File Server (srv2.sys) | Info disclosure + LPE chain | SYSTEM LPE | July 2024 |
+
+### 12.2 CVE-2024-26185 Deep Dive: NTFS Compression Parsing
+
+**Overview:**
+CVE-2024-26185 is a vulnerability in NTFS's compressed file handling (`ntfs.sys`) that
+leads to privilege escalation. The bug manifests when NTFS processes a specially crafted
+compressed data stream, allowing an attacker to influence kernel memory in a controlled way.
+
+**Background: NTFS Compression Architecture**
+
+NTFS supports LZ77-based compression on a per-file basis. Compressed files have the
+`FILE_ATTRIBUTE_COMPRESSED` flag set and store data in **compression units** (typically 16
+clusters = 64KB on a 4KB cluster volume). The `$DATA` attribute's run list interleaves
+compressed and uncompressed units.
+
+```
+Compressed $DATA run list structure:
+  [Run 1] lcn=100, length=8  → 8 clusters of compressed data (maps to 16 clusters uncompressed)
+  [Run 2] lcn=0,   length=8  → 8 virtual clusters = SPARSE / uncompressed-zeros
+  [Run 3] lcn=200, length=8  → next compression unit
+
+Compression unit with lcn=0 AND length != compression_unit_size
+→ indicates a "sparse" compression unit (all zeros, no on-disk storage)
+```
+
+**Vulnerability: Crafted compression unit boundary**
+
+The vulnerability lies in how NTFS calculates the decompression buffer when a compression
+unit boundary falls on a specific alignment relative to the start of an SMB read request.
+
+Trigger via SMB + crafted compressed stream:
+```
+1. Set up SMB share on a Windows Server or workstation with File and Printer Sharing
+2. Create NTFS compressed file with crafted run list:
+   - Compression unit at offset 0x3F000 with length = compression_unit_size - 1
+   - This creates a unit crossing a 4-cluster boundary in an unusual alignment
+3. Client reads the file via SMB at an offset that forces NTFS to decompress
+   the boundary-crossing unit
+4. Kernel decompression routine (NtfsDecompressBlock in ntfs.sys) miscalculates
+   the output buffer length:
+   - Expected output: compression_unit_size bytes
+   - Actual write: compression_unit_size + delta bytes (delta = 1..16)
+   - This writes beyond the allocated kernel buffer → heap overflow
+```
+
+**Patch analysis workflow (BinDiff `ntfs.sys` before/after March 2024 patch):**
+
+```
+Before patch (22621.3296):
+  NtfsDecompressBlock+0x1A0:
+    mov eax, [rbp+compression_unit_length]  ; load unit length
+    ; NO bounds check on (unit_length % compression_unit_size)
+    call NtfsLzDecompress
+    ; write can exceed allocated buffer if unit_length is not aligned
+
+After patch (22621.3447):
+  NtfsDecompressBlock+0x1A0:
+    mov eax, [rbp+compression_unit_length]  ; load unit length
+    ; NEW: bounds check added
+    cmp eax, [rbp+expected_unit_size]
+    ja  NtfsDecompressBlock_fail            ; STATUS_FILE_CORRUPT_ERROR if mismatch
+    call NtfsLzDecompress
+```
+
+**BinDiff workflow steps:**
+```
+1. Extract ntfs.sys from both Windows Update packages:
+   expand.exe windows10.0-kb5035853-x64.cab -F:ntfs.sys C:\before\
+   expand.exe windows10.0-kb5036893-x64.cab -F:ntfs.sys C:\after\
+
+2. Import both into Ghidra (or IDA):
+   - Rename functions using Microsoft PDB symbols:
+     .sympath srv*C:\symbols*https://msdl.microsoft.com/download/symbols
+     !reload ntfs.sys  (in WinDbg to load symbols)
+
+3. Run BinDiff on the two Ghidra databases:
+   - Primary: ntfs.sys (before patch)
+   - Secondary: ntfs.sys (after patch)
+   - Sort by similarity score — changed functions at top
+
+4. Focus on functions in the decompression path:
+   - Search for xref to LZ77 decompressor: NtfsDecompressBlock, NtfsMapUserBuffer
+   - Compare basic block counts — added blocks = new validation code
+   - Look for new conditional jumps (ja/jb/jge) before buffer write operations
+
+5. Identify the added bounds check:
+   - New compare + conditional branch before the decompressor call site
+   - Branch target: error return path (STATUS_FILE_CORRUPT_ERROR = 0xC0000102)
+```
+
+**Exploitation implications:**
+The heap overflow in the NTFS paged pool (decompression buffer is paged pool) allows
+controlled writes beyond the buffer. With kernel heap grooming (placing a controlled
+object adjacent to the decompression buffer), arbitrary kernel write becomes possible,
+leading to SYSTEM token replacement. The SMB attack vector means the bug is exploitable
+remotely (authenticated user on the same network can trigger via SMB read of a crafted file).
+
+### 12.3 CVE-2025-21333 — Hyper-V NTFS In-The-Wild (January 2025)
+
+CVE-2025-21333 was patched by Microsoft in January 2025 and confirmed as exploited in the
+wild. The vulnerability is in the Hyper-V NTFS integration — specifically in how the
+host-side NTFS driver processes certain file system control operations initiated from a
+guest VM or from the host on a NTFS volume used by Hyper-V.
+
+**Attack surface:** Hyper-V uses NTFS volumes for VM storage (`.vhdx` files, checkpoints,
+configuration). The host `ntfs.sys` processes I/O on behalf of the Hyper-V storage stack.
+A crafted NTFS volume structure or a crafted FSCTL issued through the Hyper-V integration
+components can trigger the bug in the host kernel.
+
+**Research notes:**
+- Symbols for `ntfs.sys` post-patch available from Microsoft symbol server (build 26100.2894)
+- BinDiff comparison of ntfs.sys from KB5050009 (December 2024) vs KB5050021 (January 2025)
+  shows changes in the `NtfsFsdFileSystemControl` and `NtfsCommonFileSystemControl` code paths
+- Specific FSCTL codes affected: `FSCTL_GET_REPARSE_POINT`, `FSCTL_SET_REPARSE_POINT` in
+  the Hyper-V VHD filter context (vhdmp.sys intercepts these on behalf of Hyper-V)
+
+### 12.4 CVE-2024-38100 — File Server Info Disclosure + LPE Chain
+
+CVE-2024-38100 (July 2024) affects the Windows File Server role (`srv2.sys`, `srvnet.sys`).
+The vulnerability is an information disclosure that leaks kernel memory addresses, which can
+be chained with a separate write primitive to achieve reliable LPE.
+
+**Disclosure mechanism:** An SMB2 query to a specially crafted named pipe or file path causes
+the server to include uninitialized kernel stack data in the SMB2 response packet. The leaked
+data includes kernel heap pointers from the NTFS pool allocation context.
+
+**LPE chain:**
+```
+1. CVE-2024-38100: SMB2 query → kernel pointer leak (4-8 bytes of pool address)
+2. Use leaked address to defeat KASLR (calculate ntoskrnl.exe base from pool offset)
+3. Combine with a separate write primitive (e.g., arbitrary file write via junction)
+   that now has a reliable kernel target address
+4. Overwrite a function pointer in kernel → SYSTEM code execution
+```
+
+---
+
+## 13. Windows 11 Filesystem Hardening (24H2)
+
+Windows 11 version 24H2 (released October 2024) includes several filesystem security
+hardening measures that affect both attacker primitives and defender tooling.
+
+### 13.1 Symbolic Link Hardening
+
+**Registry key symlinks — IL enforcement:**
+
+Prior to 24H2, unprivileged code running at Low Integrity Level could create registry key
+symbolic links in per-user hives. This was exploited in several LPE chains involving registry
+key junction attacks (analogous to filesystem junction attacks but in the registry namespace).
+
+In 24H2, creating registry key symlinks from Low IL now requires `SeCreateSymbolicLinkPrivilege`,
+which is not granted to Low IL processes by default. The privilege check was added in
+`CmpCreateSymbolicLink` within `ntoskrnl.exe`.
+
+```
+Before 24H2:
+  NtCreateKey(..., REG_OPTION_CREATE_LINK, ...) from Low IL:
+    → Proceeds to CmpCreateSymbolicLink
+    → Registry link created successfully
+
+After 24H2:
+  NtCreateKey(..., REG_OPTION_CREATE_LINK, ...) from Low IL:
+    → SePrivilegeCheck(SeCreateSymbolicLinkPrivilege) → FAILS
+    → STATUS_PRIVILEGE_NOT_HELD returned
+```
+
+**CreateSymbolicLink hardening for non-admin users:**
+
+The `CreateSymbolicLink` API now enforces stricter checks in 24H2 even for users with
+Developer Mode enabled. Specifically, symlinks to `\Device\` or `\DosDevices\` namespace
+paths from unprivileged contexts are now blocked, narrowing the Object Manager symlink
+attack surface.
+
+```c
+// Pre-24H2: CreateSymbolicLink could target NT device paths from Developer Mode
+CreateSymbolicLinkW(L"C:\\Users\\user\\link",
+                    L"\\Device\\HarddiskVolume3\\Windows\\System32\\",
+                    SYMBOLIC_LINK_FLAG_DIRECTORY);  // succeeded with Developer Mode
+
+// Post-24H2: Same call returns ERROR_PRIVILEGE_NOT_HELD for NT device path targets
+// Win32 paths (C:\...) still work with Developer Mode or SeCreateSymbolicLinkPrivilege
+```
+
+### 13.2 AppContainer Filesystem Isolation Improvements
+
+AppContainer sandboxes in 24H2 receive tighter filesystem isolation:
+
+**Package directory isolation:**
+- Each AppContainer process gets a unique `AC\<SID>` namespace under `%LOCALAPPDATA%\Packages\`
+- Cross-package filesystem access via junctions from the AppContainer namespace is now blocked
+  by a new check in `wcifs.sys` that validates the reparse target against the package's
+  declared capability claims
+
+**Capability-gated path access:**
+24H2 introduced a new `accessAllowed` capability type in the AppX manifest that gates
+filesystem path access through minifilter policy, rather than purely through DACL:
+
+```xml
+<!-- AppX manifest capability for filesystem access (24H2+) -->
+<Capabilities>
+  <rescap:Capability Name="accessAllowedPath" />
+</Capabilities>
+```
+
+The new `appid.sys` (version 10.0.26100+) enforces these capability-gated paths in its
+pre-create minifilter callback, returning `STATUS_ACCESS_DENIED` for AppContainer processes
+that access paths outside their declared capabilities.
+
+### 13.3 SMB Authentication Hardening (EPA Mandatory in 24H2)
+
+Starting with Windows 11 24H2 on domain-joined machines, **Extended Protection for
+Authentication (EPA)** is mandatory for all SMB connections. EPA binds the NTLM or Kerberos
+authentication token to the underlying TLS channel binding, preventing NTLM relay attacks.
+
+**Security impact on SMB-based filesystem attacks:**
+- NTLM relay via SMB coerce primitives (`PetitPotam`, `PrinterBug`, etc.) is broken when
+  EPA is enforced on the target server because the relay attacker cannot replicate the
+  channel binding
+- Researchers exploiting SMB-based NTFS vulnerabilities (e.g., CVE-2024-26185) from a
+  different machine must now authenticate with valid credentials rather than relaying
+
+```powershell
+# Verify EPA enforcement status on a 24H2 domain machine:
+Get-SmbServerConfiguration | Select-Object RequireSecuritySignature, EnableAuthenticateUserSharing
+# EPA is enforced via Group Policy:
+# Computer Configuration > Windows Settings > Security Settings >
+#   Local Policies > Security Options >
+#   "Microsoft network server: Require Extended Protection for Authentication"
+```
+
+### 13.4 NTFS Metadata Corruption Detection
+
+24H2 improves NTFS's self-healing capabilities with new metadata checksum verification:
+
+**$LogFile transaction replay validation:**
+NTFS's log file (`$LogFile`) now validates checksums on replayed transactions during
+`chkdsk` and at mount time. Crafted `$LogFile` entries that previously could cause
+kernel memory corruption during replay are now rejected.
+
+**MFT record checksum enforcement:**
+The MFT record update sequence (used for cross-sector coherence) validation was strengthened.
+NTFS now marks a volume as dirty and schedules `chkdsk` if more than a threshold number of
+MFT records fail the update sequence check, preventing silent metadata corruption.
+
+**Security research implication:** Attack techniques that rely on writing crafted raw NTFS
+structures to a volume (e.g., modifying `$LogFile` via raw disk I/O to influence NTFS
+behavior) are harder to use reliably on 24H2 volumes.
+
+```windbg
+; Check NTFS volume state flags in kernel (24H2):
+dt NTFS!_VCB <vcb_address>
+; Look for VCB_STATE_VOLUME_DIRTY flag (0x4) in VcbState
+; New in 24H2: VCB_STATE_MFT_CHECKSUM_ENFORCED flag
 ```
 
 ---
@@ -953,3 +1669,17 @@ dt nt!_OPLOCK <addr>            ; oplock state machine
 [R-6] *New Technologies File System (NTFS) — libfsntfs documentation* — libyal project — https://github.com/libyal/libfsntfs
 
 [R-7] *File System Filter Drivers (WDK)* — Microsoft — https://learn.microsoft.com/en-us/windows-hardware/drivers/ifs/file-system-filter-drivers
+
+[R-8] *CVE-2024-26185 — NTFS Elevation of Privilege Vulnerability* — Microsoft MSRC — https://msrc.microsoft.com/update-guide/vulnerability/CVE-2024-26185
+
+[R-9] *CVE-2024-30030 — Windows Error Reporting Service Elevation of Privilege* — Microsoft MSRC — https://msrc.microsoft.com/update-guide/vulnerability/CVE-2024-30030
+
+[R-10] *CVE-2025-21333 — Hyper-V NT Kernel Integration VSP Elevation of Privilege* — Microsoft MSRC — https://msrc.microsoft.com/update-guide/vulnerability/CVE-2025-21333
+
+[R-11] *Sealighter-TI: Tracing the Windows Kernel with ThreatIntel ETW* — pathtofile — https://github.com/pathtofile/SealighterTI
+
+[R-12] *AppExecLink Reparse Points — UWP Execution Aliases* — Microsoft Dev Docs — https://learn.microsoft.com/en-us/windows/msix/desktop/desktop-to-uwp-behind-the-scenes
+
+[R-13] *Windows Sandbox and WCI Filter Architecture* — Microsoft Container Documentation — https://learn.microsoft.com/en-us/virtualization/windowscontainers/deploy-containers/system-requirements
+
+[R-14] *SMB Extended Protection for Authentication (EPA)* — Microsoft — https://learn.microsoft.com/en-us/windows-server/storage/file-server/smb-security

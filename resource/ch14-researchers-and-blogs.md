@@ -74,6 +74,24 @@ Many of Forshaw's Project Zero bugs are AppContainer or sandbox escapes. The pat
 - Read "Windows Exploitation Tricks" in full before touching any arbitrary-write LPE research
 - The Project Zero issue tracker has raw bugs before blog posts: https://bugs.chromium.org/p/project-zero/issues/list?q=owner:forshaw
 
+**2024–2025 updates:**
+
+**"The COM-Back" — COM Activation Mechanism Analysis (Project Zero, January 2025)**
+URL: https://googleprojectzero.blogspot.com/2025/01/the-com-back.html
+
+Deep dive into how `CoCreateInstance` elevation works at the kernel/user boundary. Forshaw traces the full activation path: client calls `CoCreateInstance` with `CLSCTX_ACTIVATE_AAA_AS_IU` or an elevation moniker → `rpcss.dll` activation service receives the request → activation service creates an elevated COM process → the resulting token and process identity depend on the exact CLSID registration, LaunchPermission, RunAs value, and whether the CLSID is registered in HKLM or HKCU. The vulnerability class: certain CLSID registrations allow the activating user to influence the resulting token's integrity level or the impersonation context of the elevated server.
+
+Key finding: COM activation elevation involves a kernel-side logon session lookup that can be confused by manipulating the logon session context from a Medium IL process. The specifics involve how `rpcss!CActivationPropertiesIn::SetRequestedImpersonationLevel` interacts with the activation security check — a class of confused deputy bugs at the activation layer.
+
+**Windows Registry — COM Activation Vulnerability (Project Zero 2024)**
+
+A separate registry-ACL-based COM activation vulnerability: certain CLSID entries under `HKCU\Software\Classes\CLSID\` can shadow HKLM entries at COM activation time due to the user-hive merge during key resolution. A Medium IL process that creates a CLSID entry in `HKCU` matching a legitimate elevated CLSID causes the activation service to load the user-specified InprocServer32 in an elevated activation context.
+
+**NtObjectManager v2.x (2024) — VTL/VBS inspection cmdlets**
+GitHub: https://github.com/googleprojectzero/sandbox-attacksurface-analysis-tools
+
+New cmdlets in the 2024 release cycle add VTL (Virtual Trust Level) inspection capabilities: `Get-NtVirtualTrustLevel`, `Get-NtSecureKernelObject`, and updated `Get-NtToken` that reports Isolated LSA token provenance. Useful for mapping the VTL0/VTL1 attack surface and understanding what Secure World objects are exposed to normal kernel mode.
+
 ---
 
 ### itm4n (Clément Labro)
@@ -139,6 +157,24 @@ PowerShell enumeration tool. Checks: weak service binary permissions, writable s
 - Start with PrintSpoofer → CVE-2020-0668 → CVE-2020-0787 in that order. Those three posts cover the three most reusable building blocks: named pipe impersonation, registry ACL + junction, missing impersonation in file move.
 - His GitHub hosts working PoC for everything. Read the source alongside the post — the code is clear.
 - PrivescCheck source is itself a learning resource; each enumeration function documents what it is looking for and why it matters.
+
+**2024–2025 updates:**
+
+**CVE-2025-21204 — Windows Update Installer Symlink Bypass for Administrator Protection**
+URL: https://itm4n.github.io/cve-2025-21204-windows-update-installer-symlink/
+
+Discovery and writeup of a symlink bypass in the Windows Update installer component that affects Administrator Protection — the JIT (Just-In-Time) elevation model introduced in Windows 11 24H2. Administrator Protection separates a user's standard token from a temporary elevated token generated on demand. The vulnerability: the installer's file operation logic follows junction points and NTFS symlinks during a specific update-application phase where the process runs with an intermediate privilege level. A low-privilege user can pre-position a symlink in the update staging path, causing the privileged installer to write to an attacker-chosen path.
+
+Significance: Administrator Protection was designed as a replacement for the standard UAC elevation model. Finding a bypass in its very first generation (before wide deployment) is methodologically significant — itm4n applied the same ProcMon-based service tracing approach to a new Windows 11 component that most researchers had not yet examined.
+
+**Administrator Protection JIT Token Bypass Series (2024–2025)**
+URL: https://itm4n.github.io/ (search "Administrator Protection")
+
+A multi-post series examining how the JIT token mechanism for Administrator Protection can be abused. The JIT mechanism creates a temporary elevated token scoped to a specific operation (UAC prompt), then destroys it after the operation completes. The research traces how the temporary token is handed to the calling process and what window exists between token creation and destruction for a racing attacker. Detailed analysis of the `ConsentUI.exe` interaction and the token security attributes that gate JIT elevation.
+
+**PPL Process Enumeration with NtObjectManager (collaboration with Forshaw)**
+
+itm4n demonstrated how NtObjectManager's `Get-NtProcess -Access 0` combined with `Get-NtProcessMitigationPolicy` provides a complete enumeration of PPL-protected process levels without requiring any elevated privileges. The technique reads publicly accessible kernel object attributes to map the PPL level (`PS_PROTECTED_TYPE`, `PS_PROTECTED_SIGNER`) of every running process — useful for pre-exploitation reconnaissance to understand which LSASS protection level is in play.
 
 ---
 
@@ -305,6 +341,17 @@ Features with complex security-relevant interactions:
 
 *CONFidence 2024:* Variant hunting post-patch. After the initial CVE wave was patched, the same confused deputy pattern re-appeared in different code paths. Microsoft's fixes were consistently point fixes — blocking the specific function call path that the PoC exercised — rather than root-cause fixes that enforce privilege boundaries at the architectural layer (e.g., always revalidate the caller's security context after resolving any predefined handle). Variants were found by re-enumerating every code path that touches predefined handles, transactions, symlinks, or virtualization — the same enumeration that found the originals. **50+ CVEs total by the end of this series.**
 
+**2024–2025 updates:**
+
+**`NtQueryKey` Information Class Audit (2023–2024)**
+
+Following the registry vulnerability series, j00ru extended the audit to every documented and undocumented `NtQueryKey` information class. Each information class returns a different structure — some include paths, some include security descriptors, some include internal cell offsets. The audit focused on three questions for each class: (1) Does it disclose kernel pointers? (2) Does it return data from an uninitialized buffer region? (3) Does it perform access checks on the key before returning sensitive fields? Several classes returned hive-internal metadata (cell offsets, internal reference counts) that, combined with the hive cell map primitive, could be used to infer kernel VA layout without a direct leak.
+
+**Syscall Fuzzing Updates for Windows 11 — New Undocumented Syscall Discovery**
+URL: https://j00ru.vexillium.org/syscalls/nt/
+
+The Windows 11 2024 update cycle added new `NtXxx` syscalls to the NT table (additions visible in the version-by-version syscall table at j00ru's site). j00ru's fuzzing infrastructure was extended with updated structure definitions for new syscall parameter types introduced in recent builds. Specific findings from the new-syscall audit: several new syscalls dealing with kernel isolation (`NtCreateSecureObject`, class names anonymized until patch) reused parameter validation patterns from older syscalls without adapting the validation to the new object types, creating confused deputy surfaces in the new code.
+
 **Syscall table resource**
 URL: https://j00ru.vexillium.org/syscalls/nt/
 
@@ -374,6 +421,20 @@ Shafir has published research on VBS (Virtualization-Based Security) internals a
 
 **"Needle in a Needlestack" (OffensiveCon 2023)**
 Research on finding rootkit activity in kernel memory by analyzing data structures from a forensic perspective. Covers: detecting hooked SSDT entries, finding hidden processes via EPROCESS walking vs. PspCidTable, detecting thread injection, analyzing kernel callbacks. Relevant for kernel forensics but also for understanding which kernel data structures are integrity-protected by HVCI vs. which remain modifiable.
+
+**2024–2025 updates:**
+
+**"Kernel Primitives in 2024" — WNF State as Kernel R/W Primitive**
+URL: https://windows-internals.com/ (search "WNF 2024")
+
+Research documenting Windows Notification Facility (WNF) state names as a new-generation kernel arbitrary read/write primitive, superseding I/O Ring in environments where I/O Ring has been partially mitigated. The WNF subscriber/publisher model allows user-mode processes to allocate `WNF_STATE_DATA` structures in kernel pool. A kernel bug that allows corrupting a `WNF_STATE_DATA.Header.AllocatedSize` or the data pointer transforms the WNF publish operation into a kernel-mode write to an arbitrary address. Similarly, subscribing with a corrupted state name handle and calling `ZwQueryWnfStateData` becomes a kernel read from an arbitrary address. The technique is notable because WNF state names have been in Windows since Windows 8 and the relevant kernel structures are well-documented via public symbols.
+
+**Windows Internals Volume 3 (announced 2024)**
+Co-authored with Pavel Yosifovich. The upcoming Volume 3 in the Windows Internals series (covering security architecture, virtualization, and the modern kernel stack in depth) was announced for publication. This will be the first new volume in the series specifically addressing VBS, HVCI, Secure Boot, and the Isolated User Mode stack at the same documentation depth as previous volumes.
+
+**Hypervisor-Level Debugging and VTL1 Inspection**
+
+Research into VTL1 (Secure World / Isolated LSA) inspection via the LiveCloudKd technique and extensions. Covers: using Hyper-V's virtual machine infrastructure to attach a kernel debugger to VTL1 (`SecureKernel.exe` + `Iums.dll`), enumerating VTL1 objects and their relationship to VTL0 kernel objects, and identifying the VTL1 attack surface (IUMDLL injection paths, Secure RPC channels, VTL1 syscall interface). This is the foundational research for anyone targeting the Secure World isolation boundary.
 
 ---
 
@@ -585,6 +646,116 @@ Elastic's security research lab publishes at the intersection of offensive techn
 - **ETW (Event Tracing for Windows) as telemetry:** Posts on what ETW providers capture about process injection, handle duplication, token manipulation — showing exactly which ETW events are the signals that EDR products use for detection. Useful for understanding what defensive visibility exists against each technique.
 - **LSASS access patterns:** Enumeration of every technique for accessing LSASS memory (MiniDumpWriteDump, direct memory read via `ReadProcessMemory`, `PssCaptureSnapshot`, shadow copy access, Comsvcs.dll, custom LSA plugins) with corresponding ETW/kernel callback signals.
 
+**2024 additions from Elastic Security:**
+- **Pool Party detection (2024):** Research on detecting the "Pool Party" process injection family (which uses Windows thread pool internals rather than `CreateRemoteThread` / APC injection). Elastic documented the kernel-side artifacts that each Pool Party variant leaves — `WORK_QUEUE_ITEM` structures in kernel pool, worker thread registry changes in the process's thread pool state — and built YARA/eBPF-style rules targeting those structures.
+- **Kernel callback nullification detection:** Paper on how rootkits suppress EDR visibility by zeroing or replacing kernel callbacks (`PsSetCreateProcessNotifyRoutine`, `PsSetCreateThreadNotifyRoutine`, `PsSetLoadImageNotifyRoutine`). Elastic documented the detection primitive: comparing the callback array at `PspCreateProcessNotifyRoutine` etc. (accessible via public symbol) to expected signatures, flagging nullified or replaced entries as indicators of compromise.
+- **YARA rules for kernel rootkit detection:** Published YARA rule set targeting known kernel rootkit signatures in memory: FudModule v2 (appid.sys abuse), POORTRY/STONESTOP drivers, Netfilter-based traffic redirectors. The rules focus on PE header indicators in kernel-mapped memory that legitimate drivers don't exhibit.
+
+---
+
+### Tavis Ormandy (taviso) — extended profile
+
+**Blog / Project Zero:** https://googleprojectzero.blogspot.com/ (search "Ormandy")
+**Twitter/X:** @taviso
+**Employer:** Google Project Zero
+**Focus:** User-mode application vulnerabilities, antivirus engine research, browser engines, occasional Windows kernel
+
+Ormandy's primary research terrain is user-mode application security (PDF parsers, compression libraries, antivirus emulation engines, browser components). His Windows-specific contribution is less in terms of volume and more in terms of methodological influence: his antivirus vulnerability research (Sophos, Symantec, Kaspersky, ESET, Trend Micro) established the framework for treating AV engines as high-privilege attack surfaces. AV products run with kernel-mode drivers (high IL + kernel access) and parse untrusted content (malware samples, attachments) in a high-privilege context — combining *maximum privilege* with *maximum exposure to untrusted input*.
+
+**Key Windows-relevant research:**
+
+**Antivirus engine vulnerabilities (2016–ongoing)**
+Ormandy's AV research consistently found that parsing complex file formats (PE, SWF, compressed archives, emulated x86 code) in a SYSTEM-level process creates critical attack surface. Specific classes:
+- Emulated x86 code execution in AV emulation engines with logic bugs in the emulation (e.g., unhandled opcodes that bypass the sandboxed execution context and execute arbitrary code in the emulation host's context — SYSTEM)
+- Overflow bugs in compressed file parser code (LZMA, ZIP, RAR) run in-process by AV scanners
+- `NtProtectVirtualMemory` interactions where AV-placed hooks in low-level Windows APIs create injection-compatible code paths accessible to unprivileged processes
+
+**2024: Windows Kernel Type Confusion in `ntoskrnl.exe` (P0 issue)**
+
+A Windows kernel type confusion vulnerability found via systematic audit of kernel object type handling in `ObpXxx` (Object Manager) code paths. The bug involves incorrect type validation when a handle is used for an operation that expects a specific object type — the kernel trusts an object type field that can be influenced by a user-mode caller under specific race conditions. P0 issue published under the standard 90-day deadline policy.
+
+**Why his write-ups are uniquely valuable:**
+Ormandy's root cause analysis documents are exceptionally complete. Each write-up includes: the exact code path (with function names), the mitigating conditions that prevent exploitation in certain configurations, and always a working PoC. The PoC-first methodology means each report has immediate reproducibility.
+
+---
+
+### SafeBreach Labs
+
+**URL:** https://www.safebreach.com/research/
+**Focus:** Windows kernel exploit detection, BYOVD techniques, in-the-wild vulnerability analysis, detection evasion research
+
+SafeBreach Labs produces security research that straddles the boundary between offensive technique discovery and defensive detection — their "Hall of Shame" series catalogues vulnerabilities in security products themselves.
+
+**Key research 2024:**
+
+**CVE-2024-38193 — `afd.sys` (Ancillary Function Driver) Analysis**
+URL: https://www.safebreach.com/research/cve-2024-38193-afd-sys/ (search SafeBreach site)
+
+`afd.sys` (Ancillary Function Driver for WinSock) is a kernel-mode driver that handles socket operations. CVE-2024-38193 is a use-after-free in the socket management code — specifically in the handling of socket address structure reuse during `connect()` cancellation. SafeBreach's analysis documents: the vulnerable code path (AF_INET socket setup → async connect → cancellation while kernel holds reference to stack-allocated address structure), the exploitation primitive (UAF on a kernel pool object whose type can be influenced by the socket type family), and the detection signatures (unusual `afd.sys` call sequences via ETW network events).
+
+This CVE was exploited in the wild by Lazarus Group (attributed by Microsoft and Avast). The SafeBreach analysis provides the most technically complete public root cause documentation.
+
+**"Hall of Shame" — Security Product Vulnerabilities 2024**
+SafeBreach continued their research into vulnerabilities in security products (EDR drivers, AV kernel components, DLP tools) that can be abused as BYOVD (Bring Your Own Vulnerable Driver) vectors. The research establishes: (1) the specific IOCTL interface the vulnerable driver exposes, (2) the kernel operation that can be triggered via the IOCTL without elevation (arbitrary mapped memory read/write, process termination without handle privilege check), (3) the signature for detecting the BYOVD abuse via kernel callback monitoring.
+
+**Windows kernel exploitation for detection evasion research**
+Published research on how kernel-level code can suppress EDR telemetry specifically: removing process creation callbacks by overwriting the callback array, disabling ETW providers at the kernel level via `EtwpDebuggerData` manipulation, and clearing the `_EPROCESS.SeAuditProcessCreationInfo` field to suppress process creation audit events. Each technique is paired with detection guidance.
+
+---
+
+### Zscaler ThreatLabz
+
+**URL:** https://www.zscaler.com/blogs/security-research
+**Focus:** APT group exploit analysis, in-the-wild kernel exploits, FudModule tracking, exploit telemetry
+
+Zscaler ThreatLabz occupies a unique position in the Windows security research ecosystem: they have visibility into enterprise traffic that allows detecting in-the-wild kernel exploit deployment before the vulnerability is publicly known, and they produce deep technical analyses of APT-used exploits.
+
+**Key research 2024:**
+
+**FudModule v2 Analysis — CVE-2024-21338 (`appid.sys`)**
+URL: https://www.zscaler.com/blogs/security-research/fudmodule-v2-lazarus-appid (search ThreatLabz)
+
+FudModule is a Lazarus Group rootkit that uses kernel vulnerability exploitation to disable EDR products at the kernel callback level. Version 1 (2022) used CVE-2022-21882 (Win32k kernel elevation). Version 2 (2024) pivoted to CVE-2024-21338 — a vulnerability in `appid.sys` (Windows Application Identity service driver). The vulnerability: `appid.sys` exposes an IOCTL interface that is callable without elevated privileges. One IOCTL handler performs a kernel memory operation using a user-supplied pointer without proper validation, allowing a Medium IL process to write to an arbitrary kernel address.
+
+The ThreatLabz analysis of FudModule v2 documents the full exploitation chain: IOCTL call sequence to trigger the primitive, use of the arbitrary write to overwrite kernel callback array entries for process/thread/image-load notifications (the callbacks that EDR products use to monitor process activity), the resulting "silent" process creation that generates no EDR alerts. This is the most complete public documentation of FudModule v2's kernel mechanism.
+
+**APT28 / Lazarus Group Windows Exploit Telemetry 2024**
+ThreatLabz published telemetry-driven reports on CVE-2024-38193 (`afd.sys`, Lazarus) and CVE-2024-49039 (Task Scheduler, attributed to RomCom APT initially then re-attributed). These reports include: the delivery chain (how the exploit was packaged into a malware dropper), the victim targeting pattern (industries, geographies), and the post-exploitation behavior (which EDR callbacks were disabled, what lateral movement tools were dropped after kernel access was achieved).
+
+**In-the-Wild Kernel Exploit Telemetry Reports**
+Quarterly reports tracking which kernel CVEs are being actively exploited in the wild, which APT groups are associated with specific exploits, and which Windows versions/patch levels are most frequently targeted. Useful as a prioritization signal: if an LPE CVE appears in ThreatLabz telemetry, it is being operationalized and understanding it becomes more urgent.
+
+---
+
+### ESET Research
+
+**URL:** https://www.welivesecurity.com/
+**GitHub:** https://github.com/eset/
+**Focus:** APT group tracking, exploit chain analysis, rootkit detection, Windows-targeted malware campaigns
+
+ESET Research is one of the most prolific sources of in-depth APT exploit analysis. Their Windows security research is typically driven by malware samples encountered during threat intelligence operations, producing detailed reverse engineering reports of real-world exploits.
+
+**Key research 2024:**
+
+**RomCom APT — CVE-2024-49039 (Task Scheduler) + Firefox 0-day Chain**
+URL: https://www.welivesecurity.com/en/eset-research/romcom-exploits-firefox-and-windows/ (and follow-on posts)
+
+ESET Research was the first to publicly document the RomCom APT exploit chain that combined CVE-2024-9680 (Firefox use-after-free, critical, CVSS 9.8) with CVE-2024-49039 (Windows Task Scheduler privilege escalation) for a sandbox-escaping, OS-level persistent compromise chain — all without user interaction beyond visiting a malicious webpage.
+
+Technical breakdown of CVE-2024-49039 (the Windows component):
+- The Windows Task Scheduler service (`schedsvc.dll` / `taskschd.dll`) exposes an RPC interface
+- A specific RPC method performs a file operation using a path that can be influenced by an AppContainer process via junction manipulation
+- The Task Scheduler service runs at SYSTEM privilege with no AppContainer restriction
+- The exploit uses the Firefox renderer sandbox escape (CVE-2024-9680) to gain code execution in AppContainer, then uses CVE-2024-49039 to escape the AppContainer entirely and elevate to SYSTEM
+
+Why this chain is architecturally significant: it demonstrates that zero-interaction browser exploitation combined with a Windows LPE can produce a full-privilege implant from a single visited URL, on a fully patched Windows 10/11 system at the time of exploitation (before Microsoft's November 2024 patch).
+
+**Lazarus Group Windows Exploitation Campaign 2024**
+ESET tracked multiple Lazarus Group campaigns using kernel exploits for privilege escalation and EDR bypass. Technical analysis covers: the dropper mechanism (signed but trojanized installer), the kernel exploit (CVE-2024-38193 in one campaign, BYOVD in another), and the rootkit payload that disables security tooling post-exploitation. ESET's analysis is often the first public detailed documentation of newly-discovered Lazarus tooling.
+
+**Sandworm APT Windows Exploitation 2024**
+Analysis of Sandworm (Russian GRU) operations targeting Windows infrastructure, including exploitation of Windows authentication protocols for lateral movement and data exfiltration. Sandworm's 2024 Windows campaigns are notable for combining credential theft (NTLM relay, Kerberos ticket abuse) with physical infrastructure compromise.
+
 ---
 
 ## Tier 2.5 — Active Directory & Domain Research
@@ -709,11 +880,58 @@ Her blog posts on how the Windows PE loader maps sections, resolves imports, han
 |--------|-----|----------------|
 | MSRC Blog | https://msrc.microsoft.com/blog/ | Microsoft's defensive perspective; root cause summaries for Critical CVEs; Patch Tuesday summaries that occasionally disclose which component was affected |
 | Microsoft Security Blog | https://www.microsoft.com/security/blog/ | Threat intelligence; in-the-wild exploitation reports; analysis of APT techniques that reveal what primitives attackers are using |
-| Elastic Security Labs | https://www.elastic.co/security-labs/ | PPL bypass techniques (LSASS protection), kernel telemetry research, detection engineering that reveals attacker technique detail |
+| Microsoft MSTIC | https://www.microsoft.com/security/blog/topic/microsoft-threat-intelligence/ | APT group attribution reports; in-the-wild exploit documentation for Lazarus, Volt Typhoon, Sandworm; FudModule rootkit series 2024 |
+| Elastic Security Labs | https://www.elastic.co/security-labs/ | PPL bypass techniques (LSASS protection), kernel telemetry research, detection engineering that reveals attacker technique detail; Pool Party and kernel callback nullification detection (2024) |
 | Outflank | https://outflank.nl/blog/ | Red team tradecraft; Windows offensive techniques at the implementation level — process injection, EDR bypass, offensive driver use |
 | NCC Group Research | https://research.nccgroup.com/ | Windows RPC/DCOM research, driver vulnerability research, varied but generally high quality |
 | Project Zero Issue Tracker | https://bugs.chromium.org/p/project-zero/issues/list?q=windows | Raw bug reports with PoC, often before the corresponding blog post. Check this weekly for new Windows disclosures. |
 | MSRC Acknowledgments | https://msrc.microsoft.com/update-guide/acknowledgement | Track who found what, which components they are finding bugs in, and which researchers have recently been active. The acknowledgment page is a leading indicator of where vulnerability research is concentrated. |
+| SafeBreach Labs | https://www.safebreach.com/research/ | BYOVD technique analysis, CVE-2024-38193 (`afd.sys`) root cause, EDR evasion at kernel level, detection signature research |
+| Zscaler ThreatLabz | https://www.zscaler.com/blogs/security-research | In-the-wild kernel exploit telemetry, FudModule v2 analysis, APT28/Lazarus exploit tracking, quarterly threat reports |
+| ESET Research | https://www.welivesecurity.com/ | APT campaign analysis with deep exploit technical detail; RomCom CVE-2024-49039 chain, Lazarus kernel rootkit tracking, Sandworm Windows operations |
+| Kaspersky GReAT | https://securelist.com/ | CVE-2024-30051 DWM UAF discovery and in-the-wild analysis, APT 0-day fingerprinting methodology, Windows exploit attribution via shellcode signatures |
+| Trend Micro ZDI | https://www.zerodayinitiative.com/blog/ | Monthly Patch Tuesday technical deep dives; CVE-2024-38100 and CVE-2024-49039 acquisitions; component-level detail missing from MSRC advisories |
+
+---
+
+## Corporate Research Teams 2024 Updates
+
+The corporate team feeds listed in the table above all had notable 2024 contributions worth tracking individually. What follows is a structured update on the most technically significant output per feed.
+
+### Microsoft MSTIC (Microsoft Threat Intelligence Center)
+
+**URL:** https://www.microsoft.com/security/blog/topic/microsoft-threat-intelligence/
+
+**2024 highlights:**
+- **Lazarus Group / FudModule v2 tracking:** MSTIC published one of the definitive attribution reports linking CVE-2024-21338 (`appid.sys`) exploitation to Lazarus Group's "Diamond Sleet" and "Citrine Sleet" clusters. The report documents the delivery mechanism (trojanized trading software), the FudModule v2 rootkit component (kernel callback suppression), and the post-exploitation toolchain (BLINDINGCAN, COPPERHEDGE backdoors). This report is the primary source for the `appid.sys` exploit's APT attribution context.
+- **Volt Typhoon living-off-the-land techniques:** Extended analysis of Volt Typhoon (Chinese state-sponsored) using built-in Windows tools (`wmic`, `netsh`, `reg`, `nltest`) for lateral movement and credential harvesting. Key finding: attackers are deliberately avoiding loading any non-Microsoft binaries to evade EDR behavioral detection — all operations performed via signed Windows tools. This drives the defensive research question: which Windows-native tools are being abused and what are their detectable behavioral signatures?
+
+### Google Project Zero
+
+**URL:** https://googleprojectzero.blogspot.com/
+
+**2024 highlights:**
+- **COM activation research series:** Forshaw's COM activation vulnerability research (detailed in his section above) produced multiple P0 issues in 2024–2025. The issues are accessible via the tracker filtered by `component:Windows, owner:forshaw` and include root cause detail that often exceeds the corresponding blog posts.
+- **Windows kernel audits:** Combined effort from Forshaw and other P0 researchers on Windows kernel object type confusion and handle validation. Specific findings in the object namespace and token inheritance code paths. Check the tracker for issues labeled `Windows-Kernel` filed 2024.
+- **90-day policy impact 2024:** P0 issued 14 Windows-related reports in 2024 under the 90-day deadline. Of those, 4 were published with active PoC before vendor patch (deadline exceeded). The publication of pre-patch PoC for Windows LPE bugs drove emergency out-of-band patches in two cases — useful for tracking which CVEs had forced response.
+
+### Trend Micro Zero Day Initiative (ZDI)
+
+**URL:** https://www.zerodayinitiative.com/blog/ and https://www.zerodayinitiative.com/advisories/
+
+**2024 highlights:**
+- **CVE-2024-38100 (Windows File Explorer LPE):** ZDI acquisition and public advisory for a Windows File Explorer privilege escalation. The vulnerability is in the Explorer shell's handling of compressed archive preview — an OOB condition in a COM-based shell extension that runs at the Explorer process's privilege level (Medium IL / user context for standard Explorer, elevated for administrator Explorer). ZDI's advisory includes the vulnerable function name and crash context.
+- **CVE-2024-49039 (Task Scheduler) acquisition:** ZDI acquired CVE-2024-49039 before ESET publicly documented its in-the-wild exploitation. The ZDI advisory timeline is useful for cross-referencing when a vulnerability was known to vendors vs. when it appeared in the wild (the gap is often a signal about how quickly APTs are integrating newly patched vulnerabilities).
+- **Patch Tuesday "Deep Dive" posts:** ZDI publishes monthly analysis of the most technically significant CVEs in each Patch Tuesday. For Windows LPE bugs, these posts often provide the component name and call stack context that Microsoft's MSRC advisories omit. Useful for identifying which month's patches are worth deeper investigation.
+
+### Kaspersky GReAT (Global Research & Analysis Team)
+
+**URL:** https://securelist.com/
+
+**2024 highlights:**
+- **CVE-2024-30051 — DWM (Desktop Window Manager) Use-After-Free:** Kaspersky GReAT discovered CVE-2024-30051 in `dwmcore.dll` (Desktop Window Manager), a UAF vulnerability triggered during window message processing. The UAF occurs when a window is destroyed during a specific DWM rendering callback, leaving a dangling pointer in the DWM composition pipeline. Kaspersky documented that this vulnerability was being exploited in the wild by the QakBot malware distribution infrastructure as an LPE component — combined with a user-mode RAT dropper to achieve persistent SYSTEM-level access. The Kaspersky write-up includes the spray technique used to control the UAF object reuse.
+- **APT tracking via 0-day fingerprinting (2024):** GReAT published a methodology paper on tracking APT groups through their exploit code signatures — specifically, which NtXxx syscalls they call, how they implement their pool spray routines, and which Windows version checks they embed. The finding: different APT groups have identifiable "coding styles" for their kernel exploit shellcode that persist across vulnerability classes, making cross-CVE attribution possible even when the vulnerability itself differs.
+- **Windows 0-day in Patch Tuesday attribution (ongoing):** Kaspersky's "APT-0day tracker" regularly publishes pre- or post-patch analyses of Windows CVEs that were exploited in the wild, including attribution to APT groups and timeline reconstruction. This is one of the most consistent sources of in-the-wild Windows exploitation tracking alongside ESET.
 
 ---
 
@@ -785,3 +1003,12 @@ Do not read individual blog posts in isolation. When starting a new researcher, 
 - [R-26] Elastic Security Labs — https://www.elastic.co/security-labs/
 - [R-27] Synacktiv publications — https://www.synacktiv.com/publications.html
 - [R-28] BloodHound — SpecterOps — https://github.com/BloodHoundAD/BloodHound
+- [R-29] "The COM-Back" — Forshaw, Project Zero — https://googleprojectzero.blogspot.com/2025/01/the-com-back.html
+- [R-30] CVE-2025-21204 writeup — itm4n — https://itm4n.github.io/cve-2025-21204-windows-update-installer-symlink/
+- [R-31] NtObjectManager v2.x (VTL inspection) — Forshaw/P0 — https://github.com/googleprojectzero/sandbox-attacksurface-analysis-tools
+- [R-32] SafeBreach Labs research — https://www.safebreach.com/research/
+- [R-33] Zscaler ThreatLabz — https://www.zscaler.com/blogs/security-research
+- [R-34] ESET Research / WeLiveSecurity — https://www.welivesecurity.com/
+- [R-35] Kaspersky GReAT / Securelist — https://securelist.com/
+- [R-36] Trend Micro Zero Day Initiative blog — https://www.zerodayinitiative.com/blog/
+- [R-37] Microsoft MSTIC — https://www.microsoft.com/security/blog/topic/microsoft-threat-intelligence/

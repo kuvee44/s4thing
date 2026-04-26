@@ -136,6 +136,40 @@ dt nt!_EPROCESS poi(poi(@$prcb+0x8)) Protection
 ; Protection.Signer: see PS_PROTECTED_SIGNER enum
 ```
 
+**PPL Bypass Research 2024:**
+
+- **CVE-2024-21338 (February 2024):** `appid.sys` kernel vulnerability exploited by Lazarus Group. Provides kernel read/write primitive → strips PPL protection flags directly from the target process's `EPROCESS.Protection` field. This is stealthier than BYOVD because it abuses a legitimate signed kernel driver that ships with Windows — no need to load a third-party vulnerable driver.
+
+  ```
+  Attack chain:
+  1. Exploit appid.sys to gain kernel R/W
+  2. Find target process EPROCESS address
+  3. Overwrite EPROCESS.Protection byte to 0x00 (unprotected)
+  4. Now OpenProcess(PROCESS_ALL_ACCESS) on lsass succeeds
+  5. Dump credentials / inject code
+  ```
+
+- **CVE-2024-26218 (April 2024):** Windows Kernel EoP — bypasses integrity-level enforcement mechanisms used by PPL. Allows bypassing the pre-DACL PPL check via crafted access token manipulation.
+
+- **EDR silencing via PPL bypass:** Multiple red team blogs (2024) documented killing EDR agents by using kernel exploits to strip `EPROCESS.Protection` flags from the EDR service's process, then terminating it via `TerminateProcess`. The process goes from PPL-WinAntimalware to unprotected without any ELAM re-evaluation.
+
+- **PPL VTL1 enforcement in 24H2:** On compatible hardware (HVCI-capable systems), some PPL flags are partially backed by the Secure Kernel running in VTL1. Overwriting `EPROCESS.Protection` in VTL0 kernel memory does not fully disable protection if VTL1 is actively validating the protection state. This is an evolving mitigation — not uniformly enforced yet.
+
+**Tools:**
+- [PPLcontrol by itm4n](https://github.com/itm4n/PPLcontrol) — inspect and manipulate PPL protection levels
+- PPLdump — dump PPL-protected process memory using a cross-process handle leak technique
+
+```powershell
+# Check PPL level of all running processes
+Get-NtProcess -Access QueryLimitedInformation | ForEach-Object {
+    try {
+        if ($_.IsProtectedProcess) {
+            Write-Host "$($_.Name) [PID $($_.ProcessId)]: PPL=$($_.ProtectionLevel)"
+        }
+    } catch {}
+}
+```
+
 ### 1.3 Token Privilege Abuse Patterns
 
 Certain privileges are dramatically more dangerous than others. When auditing a process for privilege escalation potential, the following privileges are the highest-value targets:
@@ -361,6 +395,14 @@ SE_SACL_MANDATORY_LABEL_NO_EXECUTE_UP — processes below object's IL cannot exe
 
 Allows a process to change an object's mandatory label. Normally, you can only lower an object's label (to match or below your own level). With `SeRelabelPrivilege`, you can raise it. Rarely granted, but some AV/EDR products grant it — overlooked escalation vector.
 
+### MIC Updates 2024–2025
+
+- No new named integrity levels were introduced.
+- **Enforcement tightened:** More system services were moved to PPL, making the MIC IL boundary enforcement more difficult to exploit alone — attackers now need kernel-level access to bypass both MIC and PPL simultaneously.
+- **VTL1 interactions:** On HVCI-capable hardware with Credential Guard or Secure Kernel active, some operations are impossible even for processes at SYSTEM integrity level — the Secure Kernel enforces a secondary check that MIC cannot override.
+- **Windows Server 2025:** Stricter MIC policies applied to SMB and RPC interfaces. Some remote procedure call entry points now enforce that callers meet a minimum integrity level (Medium or High) before processing requests.
+- **COM/RPC server enforcement:** Several COM and RPC servers were updated to explicitly check caller integrity level via `GetTokenInformation(TokenIntegrityLevel)` before processing sensitive requests, adding a software-layer MIC check in addition to the OS-level policy.
+
 ---
 
 ## 5. User Account Control (UAC)
@@ -471,6 +513,71 @@ If any directory before System32 is user-writable (e.g., the application directo
 # Then check if the search path directories are user-writable
 icacls "C:\SomePath\" | findstr /i "(F) (M) (W)"
 ```
+
+### 5.2 UAC Bypass Techniques — New in 2024–2025
+
+#### CVE-2024-6769 (Fortra, 2024)
+**CVSS:** 6.3. Chain: Drive Remapping + SxS DLL Poisoning + auto-elevated COM objects.
+
+```
+Attack chain:
+1. Create a virtual drive remapping (e.g., subst X: C:\Users\attacker\malicious)
+2. Place a malicious DLL in a path that shadows a legitimate System32 DLL
+   via the Side-by-Side (SxS) assembly search order
+3. Trigger an auto-elevated COM object whose activation search hits the poisoned path
+4. COM object auto-elevates (no UAC prompt) → loads attacker DLL → High IL code execution
+```
+
+This chain was particularly notable because it combined three individually-known techniques (drive remapping, SxS redirection, COM elevation) in a novel sequence not previously documented as a single CVE.
+
+#### MockDirs — Trusted Directory Spoofing (Unpatched as of 2025)
+Create a directory named `C:\Windows \System32\` (note the trailing space). Windows path normalization in some contexts strips the trailing space, causing the spoofed path to be treated as the real System32.
+
+```cmd
+mkdir "C:\Windows \System32"
+copy malicious.exe "C:\Windows \System32\malicious.exe"
+```
+
+Auto-elevation path validation checks `C:\Windows\System32\` but the spaced variant passes because it is technically a different path that some path normalization functions collapse to the same result. Still unpatched as of mid-2025.
+
+**Reference:** [UACME](https://github.com/hfiref0x/UACME) method list documents this technique.
+
+#### COM Object Hijacking via HKCU
+**Targets:** `fodhelper.exe`, `computerdefaults.exe`, `sdclt.exe` — all auto-elevated, all look up COM class registrations.
+
+**Mechanism:** COM class registration lookups follow `HKCU\Software\Classes\CLSID` before `HKLM\SOFTWARE\Classes\CLSID`. A standard user can create entries in `HKCU` without elevation.
+
+```powershell
+# Generic COM hijack pattern for auto-elevated processes
+$clsid = "{TARGET-CLSID-HERE}"
+$regPath = "HKCU:\Software\Classes\CLSID\$clsid\InprocServer32"
+New-Item -Path $regPath -Force
+Set-ItemProperty -Path $regPath -Name "(Default)" -Value "C:\Users\user\payload.dll"
+Set-ItemProperty -Path $regPath -Name "ThreadingModel" -Value "Apartment"
+# Trigger the auto-elevated target process
+```
+
+**Threat actor usage 2024:** LockBit and BlackBasta ransomware affiliates both documented COM Object Hijacking against `computerdefaults.exe` and `sdclt.exe` in 2024 incident response reports as their UAC bypass of choice — reliable, doesn't touch disk in a noisy way, widely available in red team kits.
+
+#### CVE-2024-38100 (July 2024)
+**CVSS:** 7.8. Windows File Explorer shell extension EoP. A specially crafted shell extension interaction in Explorer's elevated context allows an attacker to achieve High IL code execution. Patched in July 2024 Patch Tuesday.
+
+#### CVE-2025-21204 (April 2025)
+**CVSS:** 7.8. Windows Process Activation EoP via symbolic link/junction during Windows Update processing. The vulnerability exists in both UAC and Administrator Protection paths — even the newer JIT token mechanism is affected when the symlink is planted before the elevated process runs.
+
+```
+Attack pattern:
+1. Monitor for Windows Update processing activity (WMI event subscription or service polling)
+2. At the right moment, plant a directory junction or NTFS symbolic link
+   at the path where Windows Update writes intermediate files
+3. Update processing code follows the link — privileged file write to attacker-chosen location
+4. Use privileged write for persistence or service binary replacement
+```
+
+**Note:** This CVE is relevant to both §5 (UAC) and §9 (Administrator Protection) — the symlink race condition affects both elevation mechanisms.
+
+#### UACME Project Reference
+[UACME by hfiref0x](https://github.com/hfiref0x/UACME) is the canonical public repository of UAC bypass methods. It was actively updated throughout 2024 with new methods targeting Windows 11 23H2 and 24H2 variants. Security researchers use it as a reference for understanding which bypass classes remain viable on current patch levels.
 
 ---
 
@@ -600,11 +707,64 @@ $token.AppContainerNumber                 # Numeric container ID
 
 LPAC removes even the `ALL APPLICATION PACKAGES` / `ALL RESTRICTED APPLICATION PACKAGES` grants, limiting access further. The Edge render process runs in LPAC. Most AppContainer escape vulnerabilities involve finding objects that grant `ALL APPLICATION PACKAGES` access without the LPAC exception.
 
-### Escape Patterns
+### 7.4 Escape Patterns — Classic
 
 - Object with `ALL APPLICATION PACKAGES: WRITE` but not LPAC-aware → AppContainer can write, LPAC process cannot
 - COM server registered accessible to AppContainer but implementing a dangerous operation
 - Named pipe with `ALL APPLICATION PACKAGES: CONNECT` → AppContainer can connect and impersonate
+
+### 7.5 AppContainer Escape Research — 2024–2025
+
+#### CVE-2024-21399 (February 2024) — Microsoft Edge Sandbox Escape
+**CVSS:** 8.3. An AppContainer sandbox escape in the Microsoft Edge (Chromium-based) browser. Exploited by a malicious web page within the Edge renderer (LPAC) to break out of the AppContainer boundary and execute code in a Medium-IL context. Patched in Edge update released February 2024.
+
+The vulnerability class involved a boundary crossing between the LPAC-isolated renderer process and the broker process through an insufficiently validated inter-process communication channel. The IPC endpoint had an ACE granting access to a capability SID that was present in the renderer's token, but the method handler did not enforce appropriate restrictions on what the renderer could request.
+
+#### COM Activation Bypass (itm4n research, early 2025)
+Researcher itm4n documented a technique where capability SID misconfiguration in COM server activation policies allows an AppContainer process to activate a COM server it should not have access to, then use that server's elevated context to escape the sandbox.
+
+**Core concept:**
+```
+1. Identify a COM class registered with an activation DACL that grants access
+   to a specific capability SID (not just ALL_APPLICATION_PACKAGES)
+2. If the AppContainer token contains that capability SID, COM activation succeeds
+   even for privileged COM servers
+3. If the COM server's method implementations do not validate the caller's
+   AppContainer context, the server executes privileged operations on behalf of
+   the AppContainer process
+```
+
+**Research blog:** https://itm4n.github.io (search for AppContainer / COM activation posts from early 2025)
+
+#### Windows Filtering Platform (WFP) Network Isolation Bypass
+The AppContainer sandbox is supposed to enforce network isolation — only capabilities like `internetClient` should allow outbound connections. This isolation is implemented via Windows Filtering Platform (WFP) callout drivers.
+
+Misconfigured WFP rules (or rules added by third-party security software) can inadvertently allow AppContainer processes to make network connections that bypass capability checks:
+
+```
+Attack scenario:
+1. Third-party firewall or VPN driver adds a WFP permit rule too broadly
+   (e.g., permits all TCP from any process to a specific IP range)
+2. AppContainer process without internetClient capability can now connect
+   to addresses in that range because the WFP permit fires before the
+   AppContainer isolation callout
+3. If those addresses include attacker infrastructure, data exfiltration
+   or C2 communication becomes possible from sandboxed context
+```
+
+#### Symbolic Link / Object Manager Attack (ZDI, Q1 2024 — Patched)
+A ZDI disclosure in Q1 2024 documented an Object Manager namespace symbolic link attack where an AppContainer process could create object directory entries in a location that would be followed by a privileged process, leading to an out-of-sandbox file write. Patched in the Q1 2024 Patch Tuesday cycle.
+
+#### AppContainer Escape Attack Surface — 2024 Summary
+
+| Vector | Status as of 2025 |
+|--------|-------------------|
+| WFP Rule Abuse (network bypass) | Partially mitigated — depends on third-party drivers |
+| COM Server Activation abuse | Patches ongoing — new instances found regularly |
+| RPC endpoint exposure | Active research area — several disclosures in 2024 |
+| Symbolic link / Object Manager | Patched Q1 2024 |
+| Edge Chromium sandbox escape CVE-2024-21399 | Patched February 2024 |
+| Capability SID misconfiguration | Ongoing audit work — some gaps remain |
 
 ---
 
@@ -639,7 +799,153 @@ whoami /priv | findstr SeImpersonatePrivilege
 
 ---
 
-## 9. Key Security APIs
+## 9. Administrator Protection (Windows 11 24H2)
+
+Administrator Protection is the most significant change to the Windows security model in 2024. It is a preview feature in Windows 11 24H2 that fundamentally redesigns how administrative elevation works, addressing the core weaknesses in the traditional UAC model.
+
+### The Problem Administrator Protection Solves
+
+Under traditional UAC, when an administrator elevates a task:
+1. The same user account's existing token is promoted to High IL
+2. The elevated token remains associated with the same logon session
+3. The token persists for the duration of the elevated process
+4. Malware running in the same session context can potentially steal or abuse the elevated token
+
+The elevated token is not truly isolated — it belongs to the same account and can be reached by other processes in the same session via token handles, named pipe impersonation, or process injection.
+
+### Technical Implementation — JIT Temporary Account Model
+
+Administrator Protection takes a fundamentally different approach: instead of elevating the existing user's token, Windows creates a brand new temporary local administrator account for each elevation request.
+
+```
+Step-by-step elevation under Administrator Protection:
+
+1. User or application requests elevation
+   (e.g., runs a setup.exe with requireAdministrator manifest)
+
+2. Windows determines elevation is required
+   → AppInfo service creates a BRAND NEW temporary local user account
+   → The account has a unique, randomly generated name
+   → The account is added to the local Administrators group
+
+3. Windows Hello authentication
+   → User must authenticate via Windows Hello (biometric or PIN)
+   → This is a CRYPTOGRAPHIC proof of user intent — not a simple UI click
+   → Without enrolled Windows Hello, Administrator Protection cannot be used
+
+4. JIT token creation
+   → A unique isolated access token is created for the temporary account
+   → Token has High integrity level
+   → Token is NOT linked to the user's existing Medium-IL logon session
+
+5. Elevated process execution
+   → The process (e.g., setup.exe) runs under the TEMPORARY ACCOUNT's token
+   → It has admin privileges but is completely isolated from the user's session
+   → The user's original Medium-IL session continues unaffected
+
+6. Cleanup on exit
+   → When the elevated process exits:
+      - The JIT token is immediately destroyed
+      - The temporary local account is immediately deleted
+      - No persistent admin token remains anywhere in the system
+```
+
+**Key difference from UAC:** UAC switches *which token* the same account uses. Administrator Protection creates an entirely *separate account* that exists only for the duration of the elevated task. There is no persistent token for malware to steal because the token is destroyed when the process exits.
+
+### UAC vs Administrator Protection Comparison
+
+| Characteristic | UAC | Administrator Protection |
+|----------------|-----|--------------------------|
+| Authentication type | UI click (consent dialog) | Windows Hello (biometric/PIN — cryptographic) |
+| Token creation mechanism | Switch existing user token to High IL | Create new JIT temporary local account + token |
+| Token isolation | Same account, different privilege level | Completely separate account |
+| Silent elevation | Possible for whitelisted binaries | Blocked — all elevations require Windows Hello |
+| Token lifetime | Persists for duration of elevated process | Destroyed immediately when process exits |
+| Malware token theft | Can steal persistent elevated token from same session | Token is destroyed — nothing left to steal |
+| Session isolation | Elevated process shares user's logon session | Elevated process runs in isolated session |
+| Installer detection bypass | Possible via manifest manipulation | Significantly harder — requires Hello auth |
+| Hardware dependency | None | Requires Windows Hello (TPM recommended) |
+| Legacy app compatibility | High | Potentially lower — some apps assume same user context |
+
+### Enabling Administrator Protection via Group Policy
+
+Administrator Protection is not enabled by default in Windows 11 24H2. It must be explicitly configured:
+
+```
+Computer Configuration
+→ Windows Settings
+→ Security Settings
+→ Local Policies
+→ Security Options
+→ "User Account Control: Configure type of Admin Approval Mode"
+→ Set value to: "Administrator Protection mode"
+```
+
+**Prerequisites:**
+1. Windows 11 24H2 (build 26100 or later)
+2. Windows Hello must be configured for the user (biometric enrollment or PIN set)
+3. Without Windows Hello, the elevation prompt will ask for the user's password instead — degraded experience
+
+```powershell
+# Check if Administrator Protection is enabled via registry
+$regPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System"
+$value = Get-ItemProperty -Path $regPath -Name "TypeOfAdminApprovalMode" -ErrorAction SilentlyContinue
+if ($value) {
+    switch ($value.TypeOfAdminApprovalMode) {
+        0 { Write-Host "UAC Admin Approval Mode: Disabled" }
+        1 { Write-Host "UAC Admin Approval Mode: Default UAC (Filtered token)" }
+        2 { Write-Host "UAC Admin Approval Mode: Administrator Protection (JIT token)" }
+    }
+}
+```
+
+### Bypass Research 2024–2025
+
+Despite the stronger design, Administrator Protection has known bypass vectors:
+
+#### CVE-2025-21204 (April 2025) — Symlink Race Condition
+**CVSS:** 7.8. A symbolic link / junction attack during Windows Update processing that affects both traditional UAC and Administrator Protection.
+
+```
+Timeline:
+1. Administrator Protection creates a temporary admin account
+2. Windows Update or an MSI installer (triggered by elevation) processes files
+3. Attacker plants a directory junction or NTFS symlink at the target write path
+   BEFORE the elevated process writes to it
+4. Elevated process follows the junction → writes to attacker-chosen location
+5. Result: privileged file write independent of the token mechanism
+```
+
+The vulnerability is in the *what the elevated process does*, not in the token creation mechanism itself. Administrator Protection's JIT token model does not protect against symlink races in the elevated process's code.
+
+#### Legacy COM Elevation Techniques
+Several COM elevation monikers and whitelisted COM objects that bypass UAC also bypass Administrator Protection in specific configurations. The COM activation path that does not require a consent prompt (auto-elevation for whitelisted CLSIDs) can in some cases fire without triggering the Windows Hello requirement.
+
+#### Temporary Admin Token Abuse During the Execution Window
+Administrator Protection destroys the token when the elevated process exits — but during the brief window when the elevated process is running, the token exists. Attack vectors during this window:
+
+- **Named pipe impersonation:** If the elevated process creates a named pipe and can be coerced to connect to an attacker-controlled pipe, impersonation of the JIT token is possible while it exists.
+- **Process injection during execution:** If code injection into the elevated process succeeds while it is running, the injected code executes under the JIT token.
+
+The window is short — typically seconds — but automated attacks that monitor for elevated process creation via ETW or WMI can attempt exploitation within the window.
+
+#### Installer Detection Bypass
+Windows uses heuristics to detect whether a binary is an installer (file name contains "setup", "install", manifest content, etc.) and auto-elevates it. Under Administrator Protection, auto-elevation still triggers the Windows Hello prompt. However:
+
+- Renaming or obfuscating a payload to avoid installer detection heuristics can bypass the elevation trigger
+- If the payload is launched by an already-elevated process, it inherits the elevated context without a new Hello prompt
+
+### Status and Deployment
+
+As of Windows 11 24H2 (2025): **Preview feature, not enabled by default.** Enterprise deployments can enable it via Group Policy. Consumer users must manually enable it in Security settings. Full production deployment is expected in subsequent Windows releases.
+
+**Sources:**
+- https://learn.microsoft.com/en-us/windows/security/identity-protection/administrator-protection
+- https://4sysops.com/archives/understanding-windows-11-24h2s-administrator-protection-feature/
+
+---
+
+## 10. Key Security APIs
 
 ```c
 // Open a process's token
@@ -690,7 +996,7 @@ NtFilterToken(hToken, flags, pSidsToDisable, pPrivilegesToDelete, pRestrictedSid
 
 ---
 
-## 10. Security Model Bug Patterns
+## 11. Security Model Bug Patterns
 
 | Bug Pattern | Description | Example |
 |-------------|-------------|---------|
@@ -709,14 +1015,16 @@ NtFilterToken(hToken, flags, pSidsToDisable, pPrivilegesToDelete, pRestrictedSid
 | NULL DACL on kernel object | Kernel object (event, mutex, semaphore, mapping) created with `NULL` security descriptor — any process including sandboxed ones can open it and signal/corrupt shared state | Service creates an event with `NULL` SD; AppContainer can `OpenEvent` → signal it → trigger privileged code path |
 | COM server running as SYSTEM activatable by any user | COM class registered with `LocalService`/`LocalSystem` activation but `AccessPermission` in registry is either absent or set to `Everyone:LAUNCH_ACTIVATE` | COM LPE: user instantiates SYSTEM COM object via standard CoCreateInstance, object methods execute as SYSTEM |
 | Environment variable abuse in elevated process | Auto-elevated process expands `%TEMP%` or `%PATH%` in a file load path; user can set env vars before launch | Elevated process calls `LoadLibrary("%TEMP%\\helper.dll")` → user writes malicious DLL to temp dir |
+| Symlink race during privileged write | Elevated process writes to a path that attacker redirects via junction/symlink before the write | CVE-2025-21204: symlink planted before Windows Update elevated write |
+| PPL EPROCESS flag overwrite | Kernel exploit provides arbitrary R/W → attacker zeros EPROCESS.Protection byte → PPL process becomes unprotected | CVE-2024-21338: appid.sys exploit by Lazarus Group to kill EDR PPL |
 
 ---
 
-## 11. Practical Token Manipulation Workflow
+## 12. Practical Token Manipulation Workflow
 
 This section provides a structured workflow for enumerating and analyzing tokens during security research or vulnerability analysis.
 
-### 11.1 Full Token Inspection
+### 12.1 Full Token Inspection
 
 ```powershell
 Import-Module NtObjectManager
@@ -776,7 +1084,7 @@ Inspect-Token $tok
 $tok.Close()
 ```
 
-### 11.2 Find Processes with Interesting Privileges
+### 12.2 Find Processes with Interesting Privileges
 
 ```powershell
 Import-Module NtObjectManager
@@ -820,7 +1128,7 @@ Get-NtProcess -Access QueryLimitedInformation | ForEach-Object {
 }
 ```
 
-### 11.3 Verify AppContainer Token Properties
+### 12.3 Verify AppContainer Token Properties
 
 ```powershell
 Import-Module NtObjectManager
@@ -882,7 +1190,7 @@ if ($uwpProc) {
 }
 ```
 
-### 11.4 Check If a Token Is Restricted
+### 12.4 Check If a Token Is Restricted
 
 ```powershell
 function Test-RestrictedToken {
@@ -916,7 +1224,7 @@ Test-RestrictedToken $tok
 $tok.Close()
 ```
 
-### 11.5 WinDbg Token Commands (Kernel-Mode)
+### 12.5 WinDbg Token Commands (Kernel-Mode)
 
 ```windbg
 ; Dump token for current process
@@ -955,7 +1263,73 @@ dt nt!_TOKEN @$t0 AppContainerSid
 
 ; Check trust level (PPL)
 dt nt!_TOKEN @$t0 TrustLevelSid
+
+; Check PPL protection on EPROCESS directly
+dt nt!_EPROCESS poi(poi(@$prcb+0x8)) Protection
+; Protection.Type: 0=None, 1=ProtectedLight, 2=Protected
+; Protection.Signer: see PS_PROTECTED_SIGNER enum values
+
+; Find and zero Protection byte (kernel R/W required — research context only)
+; r @$t1 = (address of EPROCESS.Protection)
+; eb @$t1 0x00
 ```
+
+---
+
+## 13. Recent Developments (2024–2025)
+
+This section consolidates the most significant security model changes and CVEs from 2024–2025 that affect Windows security model research.
+
+### 13.1 CVE Timeline
+
+| CVE | Month | CVSS | Component | Impact |
+|-----|-------|------|-----------|--------|
+| CVE-2024-21338 | Feb 2024 | 7.8 | appid.sys (kernel) | Kernel R/W → PPL bypass, used by Lazarus Group |
+| CVE-2024-21399 | Feb 2024 | 8.3 | Microsoft Edge | AppContainer sandbox escape from LPAC renderer |
+| CVE-2024-26218 | Apr 2024 | 7.8 | Windows Kernel | IL enforcement bypass affecting PPL |
+| CVE-2024-6769 | 2024 | 6.3 | UAC mechanism | Drive remap + SxS DLL + COM chain UAC bypass |
+| CVE-2024-38100 | Jul 2024 | 7.8 | File Explorer | Shell extension EoP to High IL |
+| CVE-2025-21204 | Apr 2025 | 7.8 | Windows Update / Process Activation | Symlink/junction EoP — affects UAC and Admin Protection |
+
+### 13.2 Architecture Changes in 24H2
+
+**Administrator Protection (Preview):**
+The JIT temporary account model replaces token promotion for admin elevation. See §9 for full details. This is the most significant change to the elevation model since UAC was introduced in Vista.
+
+**PPL Partial VTL1 Backing:**
+On HVCI-capable hardware, PPL protection flags for certain signer levels are now partially validated by the Secure Kernel (VTL1). Direct EPROCESS memory writes in VTL0 kernel space do not fully defeat protection if VTL1 is actively monitoring the integrity of protection state. The practical implication for exploit developers:
+
+```
+Old model: kernel R/W → zero EPROCESS.Protection → PPL bypassed
+New model (24H2 on HVCI hardware): kernel R/W → zero EPROCESS.Protection 
+  → VTL1 may re-enforce protection on next access check
+  → More complex exploit chains needed (VTL1 compromise or time-window attack)
+```
+
+**Windows Server 2025 MIC Changes:**
+SMB and RPC interfaces on Windows Server 2025 received stricter MIC enforcement. Remote callers must meet minimum integrity requirements. This primarily affects lateral movement scenarios where an attacker has code execution at a lower integrity level on a remote machine.
+
+### 13.3 Threat Actor Usage of Security Model Bugs in 2024
+
+**Lazarus Group (CVE-2024-21338):**
+North Korean state actor exploited a kernel vulnerability in `appid.sys` to strip PPL protection from security software processes, enabling credential theft from LSASS without relying on BYOVD (which is more easily detected by modern EDR telemetry).
+
+**LockBit / BlackBasta (COM Object Hijacking):**
+Ransomware affiliates documented using COM object hijacking against auto-elevated processes (`computerdefaults.exe`, `sdclt.exe`) as their standard UAC bypass. HKCU-based COM registration has no detection signature at the OS level — only behavioral analysis can catch it.
+
+**General red team commodity (MockDirs):**
+The `C:\Windows \System32\` trailing-space technique remains unpatched and is now part of multiple commercial red team toolkits. Microsoft has historically not treated MockDirs as a security boundary violation because UAC is not a security boundary in their model.
+
+### 13.4 Research Tools and References for 2024–2025
+
+| Tool / Resource | Purpose | URL |
+|-----------------|---------|-----|
+| UACME | Comprehensive UAC bypass method collection | https://github.com/hfiref0x/UACME |
+| PPLcontrol | PPL inspection and manipulation | https://github.com/itm4n/PPLcontrol |
+| itm4n blog | AppContainer, COM activation, PPL research | https://itm4n.github.io |
+| NtObjectManager | Token, access check, AppContainer analysis | https://github.com/googleprojectzero/sandbox-attacksurface-analysis-tools |
+| Administrator Protection docs | Microsoft official feature docs | https://learn.microsoft.com/en-us/windows/security/identity-protection/administrator-protection |
+| 4sysops Admin Protection | Practical deployment analysis | https://4sysops.com/archives/understanding-windows-11-24h2s-administrator-protection-feature/ |
 
 ---
 
@@ -993,3 +1367,11 @@ dt nt!_SEP_TOKEN_PRIVILEGES <addr>
 - [R-9] Protected Processes — Alex Ionescu — https://www.alex-ionescu.com/?p=97
 - [R-10] UAC Internals and Bypass Techniques — Tyranid's Nest — https://www.tiraniddo.dev/
 - [R-11] Token Kidnapping / Potato Exploits — Foxglove / ohpe.it — historical CVE analysis
+- [R-12] Administrator Protection — Microsoft — https://learn.microsoft.com/en-us/windows/security/identity-protection/administrator-protection
+- [R-13] Understanding Windows 11 24H2 Administrator Protection — 4sysops — https://4sysops.com/archives/understanding-windows-11-24h2s-administrator-protection-feature/
+- [R-14] UACME — hfiref0x — https://github.com/hfiref0x/UACME
+- [R-15] PPLcontrol — itm4n — https://github.com/itm4n/PPLcontrol
+- [R-16] itm4n research blog (AppContainer, COM activation, PPL) — https://itm4n.github.io
+- [R-17] CVE-2024-21338 (appid.sys PPL bypass, Lazarus Group) — NVD — https://nvd.nist.gov/vuln/detail/CVE-2024-21338
+- [R-18] CVE-2024-21399 (Edge AppContainer escape) — MSRC — https://msrc.microsoft.com/update-guide/vulnerability/CVE-2024-21399
+- [R-19] CVE-2025-21204 (Process Activation symlink EoP) — MSRC — https://msrc.microsoft.com/update-guide/vulnerability/CVE-2025-21204

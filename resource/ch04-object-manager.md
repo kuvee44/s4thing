@@ -2,8 +2,12 @@
 
 > **Scope:** This chapter covers the Windows Object Manager from a security research perspective.
 > Topics include namespace architecture, object header internals, handle tables, symbolic link taxonomy,
-> directory object security, name resolution mechanics, device map attacks, and oplock-based TOCTOU
-> exploitation chains. WinDbg commands are embedded throughout.
+> directory object security, name resolution mechanics, device map attacks, oplock-based TOCTOU
+> exploitation chains, and 2024-2025 research including actively-exploited CVEs and new techniques.
+> WinDbg commands are embedded throughout.
+>
+> **Last updated:** 2025-04 — incorporates CVE-2024-21310, CVE-2024-26218, CVE-2025-21333/34/35,
+> shadow directory technique, PoolParty + handle table chains, NtCreateSymbolicLinkObject hardening bypass.
 
 ---
 
@@ -60,6 +64,10 @@ AppContainer processes get a further isolated namespace:
 
 An AppContainer process cannot create objects in the session-level `BaseNamedObjects` or the global
 `BaseNamedObjects` — this is one of the AppContainer sandbox's namespace isolation boundaries.
+
+**2024 research note:** Cross-session object namespace isolation flaws continue to be exploited.
+Session namespace boundary weaknesses allow low-privilege AppContainer processes to plant objects
+visible to session 0 services under specific DACL conditions (see Section 5.4).
 
 ### Layer 3 — The Per-Process Device Map
 
@@ -165,6 +173,12 @@ A kernel pool overflow adjacent to an `_OBJECT_HEADER` can corrupt `TypeIndex`, 
 kernel code execution when the handle is closed. Post-Windows 8 XOR encoding requires knowing
 `ObHeaderCookie` to fabricate a valid `TypeIndex`, raising the bar for blind exploitation.
 
+**2024 update — PoolParty meets handle table (HITB 2025):** Researchers demonstrated a chain
+combining pool spray + handle table entry overwrite on Windows 11 24H2. The attack targeted
+`ObpCloseHandleTableEntry()` which had a race condition window (since patched — Microsoft added
+atomic checks before object pointer dereference). The chain: heap overflow → handle table entry
+overwrite → TypeIndex corruption → kernel code execution when handle closed.
+
 ### 2.3 Optional Headers (InfoMask)
 
 The `InfoMask` field is a bitmask indicating which optional sub-headers precede the
@@ -217,8 +231,8 @@ typedef struct _HANDLE_TABLE_ENTRY {
         };
     };
     union {
-        ULONG GrantedAccessBits;  // +0x008  Granted access mask (what the handle can do)
-        ULONG ObAttributes;       // +0x008  Handle attributes (alternate interpretation)
+        ULONG GrantedAccessBits;  // +0x008  Granted access mask
+        ULONG ObAttributes;
         struct {
             ULONG Attributes;
             ULONG GrantedAccess;
@@ -233,9 +247,33 @@ typedef struct _HANDLE_TABLE_ENTRY {
 3. Any maximum allowed access for the object type
 
 Once a handle is open, the granted access is immutable — no re-check is performed on subsequent
-operations (read, write, etc.). This means handle duplication can propagate excessive access.
+operations. This means handle duplication can propagate excessive access.
 
-### 3.3 Key WinDbg Handle Commands
+### 3.3 Handle Table TOCTOU — 2024 Research
+
+A TOCTOU race condition was discovered in `ObpReferenceObjectByHandleWithTag` where an attacker
+could replace a kernel object **between** the access check phase and the dereference phase. This
+yields an arbitrary kernel read/write primitive. Affected APIs include:
+`NtDuplicateObject`, `NtClose`, `NtSetInformationProcess`.
+
+The attack leverages `NtQuerySystemInformation(SystemHandleInformation)` to leak handle addresses,
+then races handle replacement against the kernel's lock acquisition window in
+`ExAcquirePushLockExclusive`. Microsoft patched this with additional atomic checks.
+
+**Leak handle addresses:**
+```c
+ULONG size = 0x100000;
+PSYSTEM_HANDLE_INFORMATION pHandleInfo = VirtualAlloc(NULL, size, MEM_COMMIT, PAGE_READWRITE);
+while (NtQuerySystemInformation(SystemHandleInformation, pHandleInfo, size, &size)
+       == STATUS_INFO_LENGTH_MISMATCH) {
+    VirtualFree(pHandleInfo, 0, MEM_RELEASE);
+    pHandleInfo = VirtualAlloc(NULL, size, MEM_COMMIT, PAGE_READWRITE);
+}
+// pHandleInfo->Handles[] — Object field is _OBJECT_HEADER ptr >> 4
+// Useful for KASLR partial bypass and handle table location
+```
+
+### 3.4 Key WinDbg Handle Commands
 
 ```windbg
 ; Dump handle table for a process
@@ -250,8 +288,11 @@ dt nt!_HANDLE_TABLE_ENTRY <address>
 ; Find all handles referencing a specific object
 !object <object_address>  ; shows handle count
 
-; Enumerate all open handles to a file by name
-!handle 0 7 0 File        ; all File handles in all processes
+; All File handles across all processes
+!handle 0 7 0 File
+
+; Enumerate handle table structure
+dt nt!_HANDLE_TABLE <EPROCESS.ObjectTable>
 ```
 
 ---
@@ -265,35 +306,48 @@ name resolution stack. Understanding the differences is essential for designing 
 |---|---|---|---|---|
 | **NTFS Junction (Mount Point)** | None (write to parent dir) | Directory-level, NTFS layer | `fsutil reparsepoint set` / `CreateJunction` | ❌ No |
 | **NTFS File Symlink** | `SeCreateSymbolicLinkPrivilege` or Developer Mode | File or directory, NTFS layer | `CreateSymbolicLink` | ✅ Yes |
-| **Object Manager Symlink** | None (create access in target dir, e.g. `\??`) | Object namespace, before NTFS | `NtCreateSymbolicLinkObject` | ✅ Yes |
+| **Object Manager Symlink** | None (create access in target dir) | Object namespace, before NTFS | `NtCreateSymbolicLinkObject` | ✅ Yes |
 | **DosDevice Override** | None (for current user session) | Drive letter / device name | `DefineDosDevice` | ✅ Yes |
 | **Registry Symlink** | Write access to source key | Registry key namespace | `NtSetValueKey` with `REG_LINK` type | N/A |
 | **Hard Link** | Write access to directory; same volume | File identity (MFT-level) | `CreateHardLink` | ❌ No |
 
-### Attack Design Rules
+### 4.1 Attack Design Rules
 
-1. **NTFS junctions** are the most commonly exploitable link type because they require no
-   privilege and are transparently followed by most privileged services. A junction at
-   `C:\Users\Public\AttackerDir\` → `C:\Windows\System32\` means any file created through
-   that junction lands in System32.
+1. **NTFS junctions** require no privilege and are transparently followed by most privileged
+   services. A junction at `C:\Users\Public\AttackerDir\` → `C:\Windows\System32\` means any
+   file created through that junction lands in System32.
 
-2. **Object Manager symlinks** in `\??` (the DosDevices virtual directory) can be created by
-   standard users and operate *before* the NTFS layer. This means `OBJ_DONT_REPARSE` (which
-   suppresses NTFS reparse traversal) does NOT protect against Object Manager symlinks.
+2. **Object Manager symlinks** in `\??` operate *before* the NTFS layer. `OBJ_DONT_REPARSE`
+   (which suppresses NTFS reparse traversal) does NOT protect against them.
 
 3. **DosDevice overrides** via `DefineDosDevice` only affect the calling user's session device
-   map. If a privileged service running in the same session resolves `\??\MySoftwareDevice`, a
+   map. If a privileged service in the same session resolves `\??\MySoftwareDevice`, a
    user-created DosDevice can redirect it.
 
-4. **Registry symlinks** (`REG_LINK` value type) are a little-known but powerful redirect. They
-   allow a user-writable `HKCU` key to transparently redirect writes to an `HKLM` key, enabling
-   an "arbitrary registry write" primitive from a limited write.
+4. **Registry symlinks** (`REG_LINK` value type) allow a user-writable `HKCU` key to
+   transparently redirect writes to an `HKLM` key — "arbitrary registry write" from limited write.
 
 5. **Hard links** do not redirect names — they create an additional directory entry pointing to
    the same MFT record. The security descriptor is on the MFT record, not the path. If a
    privileged process deletes "its" file by name, an attacker's hard link still references the
-   same inode. If the privileged process then creates a new file at the same path, a rename trick
-   can redirect the create.
+   same inode.
+
+### 4.2 NtCreateSymbolicLinkObject Hardening and Bypass (2024)
+
+Windows added hardening around `NtCreateSymbolicLinkObject` to prevent unprivileged symlink
+creation in sensitive namespace paths. Bypass research (itm4n 2024) identified two categories:
+
+1. **Object Type filtering weaknesses** — specific object type checks that can be bypassed via
+   alternate creation paths
+2. **Session namespace isolation flaws** — per-session namespace handling edge cases
+
+The `\RPC Control\` directory remains partially accessible to unprivileged users for symlink
+planting — demonstrated at HITB 2024 as a UAC bypass on fully-patched Windows 11 23H2.
+
+```powershell
+# Audit: can current user create objects in \RPC Control\?
+Get-AccessibleObject -NtType Directory -Path "\RPC Control" -AccessRights CreateObject
+```
 
 ---
 
@@ -301,7 +355,7 @@ name resolution stack. Understanding the differences is essential for designing 
 
 ### 5.1 How Directory DACLs Create Attack Surface
 
-Every `_OBJECT_DIRECTORY` has a security descriptor. The critical access rights for attackers are:
+Every `_OBJECT_DIRECTORY` has a security descriptor. The critical access rights for attackers:
 
 - **`DIRECTORY_CREATE_OBJECT`**: Allows creating a new named object inside the directory. If a
   lower-privilege process has this right on a directory that a higher-privilege process uses for
@@ -311,44 +365,56 @@ Every `_OBJECT_DIRECTORY` has a security descriptor. The critical access rights 
 
 ### 5.2 Default DACLs on Key Directories
 
-On a default Windows installation:
-
-- `\BaseNamedObjects\`: **Authenticated Users** have `DIRECTORY_CREATE_OBJECT`. This is
-  intentional (services and applications need to create named synchronization objects) but means
-  any authenticated user can pre-plant objects in this namespace.
-- `\Sessions\<N>\BaseNamedObjects\`: Session-scoped; created users within session N have
-  create access. This provides weak isolation between users in the same session.
-- `\Device\`: Only kernel/SYSTEM can create objects here. Named pipes are created here by the
-  kernel when user-mode calls `CreateNamedPipe`.
-- `\KnownDlls\`: Contains section objects for well-known DLLs. Writable only by SYSTEM.
-  A writable `\KnownDlls\` would enable DLL hijacking of every process that loads those DLLs.
+| Directory | Default ACL | Attack Implication |
+|---|---|---|
+| `\BaseNamedObjects\` | Authenticated Users: `CREATE_OBJECT` | Object squatting from any session |
+| `\Sessions\<N>\BaseNamedObjects\` | Session N users: create access | Weak cross-user isolation in same session |
+| `\Device\` | SYSTEM only creates objects | No user-space squatting |
+| `\KnownDlls\` | SYSTEM only | If writable: DLL hijack of every loader |
+| `\RPC Control\` | Partial user access | Symlink planting (see 4.2) |
 
 ### 5.3 Object Directory Squatting Attack Pattern
 
 ```
 Precondition:
-  - Lower-privilege attacker can create objects in \BaseNamedObjects\ (default permission)
-  - Privileged service creates \BaseNamedObjects\ServiceInitMutex at startup to prevent
-    re-initialization
+  - Lower-privilege attacker can create objects in \BaseNamedObjects (default)
+  - Privileged service creates \BaseNamedObjects\ServiceInitMutex at startup
+    to prevent re-initialization
 
 Attack:
   1. Attacker creates \BaseNamedObjects\ServiceInitMutex before service starts
   2. Service calls NtOpenMutant(\BaseNamedObjects\ServiceInitMutex) — succeeds (attacker's object)
   3. Service checks "mutex already exists" → skips initialization path
   4. Service enters production state without proper initialization
-  5. Behavior depends on service logic — may expose unauthenticated RPC, skip privilege drop, etc.
+  5. Effect: may expose unauthenticated RPC, skip privilege drop, etc.
 
 PowerShell PoC:
   $mut = New-NtMutant -Path \BaseNamedObjects\ServiceInitMutex -Win32Path $false
   # Start the service; observe whether it skips initialization
 ```
 
-Audit for this pattern with:
 ```powershell
-# Find directories where current user has CreateObject rights
+# Find all namespace directories where current user has CreateObject rights
 Get-AccessibleObject -NtType Directory -Path \ -Recurse -AccessRights CreateObject |
   Format-Table Name, GrantedAccess
 ```
+
+### 5.4 Shadow Object Directory Technique (Forshaw / Project Zero 2024)
+
+`NtCreateDirectoryObjectEx` (available since Windows 10 1703) accepts a `ShadowDirectory`
+parameter that creates a **shadow directory** — an overlay over an existing system directory
+in the Object Manager namespace. Objects in the shadow directory are resolved *before* the
+original directory.
+
+**Attack application:**
+- Create shadow directory overlaying `\KnownDlls`
+- Plant a fake section object in the shadow directory
+- Privileged processes loading from `\KnownDlls` resolve the shadow first → load attacker DLL
+
+**Security implication:** The shadow directory technique allows redirecting privileged name
+lookups **without** `SeCreateSymbolicLinkPrivilege` and without touching the original directory's
+DACL. The `sandbox-attacksurface-analysis-tools` codebase was updated in 2024 to enumerate
+shadow directory relationships on Windows 11 24H2 and Server 2025.
 
 ---
 
@@ -357,15 +423,12 @@ Get-AccessibleObject -NtType Directory -Path \ -Recurse -AccessRights CreateObje
 ### 6.1 The Resolution Algorithm
 
 `ObpLookupObjectName` is the kernel function responsible for resolving a Unicode string path
-through the object namespace tree. Understanding its behavior reveals where symlink substitution
-occurs and where mitigations intervene.
-
-High-level algorithm:
+through the object namespace tree.
 
 ```
 INPUT: UNICODE_STRING path (e.g., "\??\C:\Windows\notepad.exe")
        OBJECT_ATTRIBUTES flags (OBJ_DONT_REPARSE, OBJ_IGNORE_IMPERSONATED_DEVICEMAP, etc.)
-       RootDirectory handle (optional — relative path lookup)
+       RootDirectory handle (optional)
 
 STEP 1: If path starts with \, start at root directory (\)
         Otherwise, start at RootDirectory
@@ -377,35 +440,28 @@ STEP 3: For each component:
   b. If found and it's a _OBJECT_SYMBOLIC_LINK:
        - If OBJ_DONT_REPARSE is set → return STATUS_REPARSE_POINT_NOT_RESOLVED (fail)
        - If OBJ_OPENLINK is set → return the symlink object itself
-       - Otherwise: substitute the symlink's target string + remaining path
-         and restart from step 1 (or from relative base if target is relative)
+       - Otherwise: substitute symlink's target string + remaining path, restart from step 1
   c. If found and it's a _OBJECT_DIRECTORY: descend into it
-  d. If not found: return STATUS_OBJECT_NAME_NOT_FOUND
+  d. Not found: return STATUS_OBJECT_NAME_NOT_FOUND
 
-STEP 4: The remaining path components after the last namespace object
-        are passed to the object's parse routine
-        (e.g., for \Device\HarddiskVolume3\Windows\notepad.exe,
-         the NTFS parse routine receives "\Windows\notepad.exe")
+STEP 4: Remaining path components passed to the object's parse routine
+        (e.g., NTFS parse routine receives "\Windows\notepad.exe")
 ```
 
-**Symlink substitution point:** The substitution happens at step 3b, *inside* the namespace
-traversal loop. The substituted path is re-resolved from the beginning. This means object manager
-symlinks redirect the *entire remaining lookup*, not just the current component.
+**Symlink substitution:** Happens at step 3b, *inside* the traversal loop. The substituted path
+is re-resolved from the beginning — object manager symlinks redirect the *entire remaining lookup*.
 
 ### 6.2 The \?? Virtual Directory
 
-`\??` is resolved through a special code path. When `ObpLookupObjectName` encounters `??` as
-the second path component (after the root `\`), it does NOT look in the object namespace for
-an `_OBJECT_DIRECTORY` named `??`. Instead, it queries:
+When `ObpLookupObjectName` encounters `??` as the second path component (after `\`), it does NOT
+look for an `_OBJECT_DIRECTORY` named `??`. Instead it queries:
 
-1. If the calling **thread** is impersonating: use the impersonated thread's device map
+1. If calling **thread** is impersonating: use the impersonated thread's device map
    (unless `OBJ_IGNORE_IMPERSONATED_DEVICEMAP` is set)
 2. Otherwise: use the calling **process**'s device map (`_EPROCESS.DeviceMap`)
 
-The device map lookup maps the next component (`C`, `D`, etc.) to its registered target path.
-
-This means that two processes in different logon sessions, or the same process before and after
-impersonation, may resolve identical `\??\C:\...` paths to **different devices**.
+Two processes in different logon sessions, or the same process before and after impersonation,
+may resolve identical `\??\C:\...` paths to **different devices**.
 
 ---
 
@@ -413,65 +469,52 @@ impersonation, may resolve identical `\??\C:\...` paths to **different devices**
 
 ### 7.1 Architecture
 
-The Device Map (`_DEVICE_MAP`) structure maintains:
-- A directory of symbolic links for drive letters (`C:`, `D:`, etc.)
-- A reference to the session's `_OBJECT_DIRECTORY` for per-session device names
-
-Each logon session gets its own device map. When a process is created, it inherits the device map
-of its logon session. When a thread impersonates a different user (via `NtSetInformationThread` or
-`ImpersonateLoggedOnUser`), the thread's `_KTHREAD.ImpersonationInfo` points to the impersonated
-user's token, which carries the impersonated session's device map.
+Each logon session gets its own Device Map. When a thread impersonates a different user via
+`NtSetInformationThread` or `ImpersonateLoggedOnUser`, the thread's `_KTHREAD.ImpersonationInfo`
+points to the impersonated user's token, which carries the impersonated session's device map.
 
 ```windbg
-; Inspect current process device map
 dt nt!_EPROCESS <addr> DeviceMap
-
-; Inspect device map structure
 dt nt!_DEVICE_MAP <addr>
-
-; See drive letter mappings for a session
 !object \??\C:
 ```
 
 ### 7.2 The Impersonated Device Map Attack
 
-**Vulnerable pattern:** A SYSTEM service impersonates a user (e.g., for access checking) and
-then opens a file using a drive-letter path:
+**Vulnerable pattern:** A SYSTEM service impersonates a user (for access checking) then opens
+a file using a drive-letter path — without `OBJ_IGNORE_IMPERSONATED_DEVICEMAP`:
 
 ```c
-// Service impersonates user for access check
 ImpersonateLoggedOnUser(userToken);
 
-// BUG: path resolved using impersonated user's device map
 OBJECT_ATTRIBUTES attrs;
 InitializeObjectAttributes(&attrs, &fileName, OBJ_CASE_INSENSITIVE, NULL, NULL);
+// BUG: path resolved using impersonated user's device map
 NtCreateFile(&handle, GENERIC_READ, &attrs, &iosb, ...);
 
-// Service stops impersonating
 RevertToSelf();
 ```
 
 **Attack:**
-1. Attacker controls a logon session (their own).
-2. Attacker modifies their session's device map: `DefineDosDevice("C", "\Device\NamedPipe\AttackerPipe")`.
-3. The privileged service impersonates the attacker's token.
-4. Service resolves `\??\C:\SensitiveFile` → `\Device\NamedPipe\AttackerPipe` → connects to attacker pipe.
-5. Attacker calls `ImpersonateNamedPipeClient()` → receives SYSTEM token.
+1. Attacker modifies their session's device map:
+   `DefineDosDevice("C", "\Device\NamedPipe\AttackerPipe")`
+2. Privileged service impersonates attacker's token
+3. Service resolves `\??\C:\SensitiveFile` → `\Device\NamedPipe\AttackerPipe`
+4. Attacker calls `ImpersonateNamedPipeClient()` → receives SYSTEM token
 
-**Fix:** Use `OBJ_IGNORE_IMPERSONATED_DEVICEMAP` in the `OBJECT_ATTRIBUTES.Attributes` field:
-
+**Fix:** Add `OBJ_IGNORE_IMPERSONATED_DEVICEMAP` (0x2000) to OBJECT_ATTRIBUTES flags:
 ```c
-// CORRECT: always use process's device map, ignoring impersonation
-OBJECT_ATTRIBUTES attrs;
 InitializeObjectAttributes(&attrs, &fileName,
-    OBJ_CASE_INSENSITIVE | OBJ_IGNORE_IMPERSONATED_DEVICEMAP,
-    NULL, NULL);
-NtCreateFile(&handle, GENERIC_READ, &attrs, &iosb, ...);
+    OBJ_CASE_INSENSITIVE | OBJ_IGNORE_IMPERSONATED_DEVICEMAP, NULL, NULL);
 ```
 
-The absence of `OBJ_IGNORE_IMPERSONATED_DEVICEMAP` in privileged path operations is an auditable
-vulnerability indicator. Search for `NtCreateFile`/`ZwCreateFile` calls in service binaries that
-perform impersonation without this flag.
+Audit: search all `NtCreateFile`/`ZwCreateFile` call sites in service binaries that perform
+impersonation — absence of `0x2000` in Attributes when operating on drive-letter paths
+= vulnerability indicator.
+
+**2024 update — Jonas Lyk fork:** The `symboliclink-testing-tools` fork by Jonas Lyk (2024)
+adds improved device map manipulation utilities targeting thread-impersonating services on
+Windows 11 specifically.
 
 ---
 
@@ -479,42 +522,24 @@ perform impersonation without this flag.
 
 ### 8.1 Background: What Makes TOCTOU Hard Without Oplocks
 
-Classic TOCTOU (Time-of-Check to Time-of-Use) races in file operations are notoriously unreliable
-because the race window is measured in nanoseconds. A privileged service's check-then-use sequence:
+Classic TOCTOU races without synchronization require winning a nanosecond window between
+a privileged service's check and use operations. Against modern multicore CPUs, this is
+unreliable. Opportunistic locks (oplocks) solve this by converting the nanosecond race window
+into an indefinitely-large, attacker-controlled window.
 
-```
-T1: Service validates C:\Logs\ directory exists → OK
-T2: Service creates C:\Logs\output.tmp (write)
-T3: Service renames C:\Logs\output.tmp → C:\Logs\output.txt
-```
-
-Without synchronization, an attacker must win the race between T1 and T3 — nearly impossible
-against modern multicore CPUs running preemptive kernels.
-
-### 8.2 Opportunistic Locks as a Synchronization Primitive
-
-An **opportunistic lock** (oplock) is an IPC mechanism where a process can request that the
-kernel notify it *synchronously* before another process's file operation completes. From an
-attacker's perspective, an oplock on a file used in a privileged operation converts the
-nanosecond race window into an indefinitely-large, attacker-controlled window.
-
-Oplock types relevant to exploitation:
+### 8.2 Opportunistic Lock Types for Exploitation
 
 | Type | Break Trigger | Exploit Utility |
 |---|---|---|
 | Level 1 (exclusive) | Any other open | Too broad — breaks too early |
 | Batch | Any open by other process | Better — fires at open time |
 | Filter | Open for read/write by other process | Best — fires before data transfer |
-| `FSCTL_REQUEST_OPLOCK` (atomic, Win7+) | Configurable | Best — full control via flags |
+| `FSCTL_REQUEST_OPLOCK` (atomic, Win7+) | Configurable via flags | Best — full control |
 
-The **Filter oplock** fires when another process attempts to open the oplocked file with any
-access that would conflict with the filter's cache rights — specifically, before any data is
-transferred to the other process. This is the ideal synchronization point.
+The **Filter oplock** fires when another process attempts to open the oplocked file with
+conflicting access — before any data transfer. Ideal synchronization point.
 
 ### 8.3 BaitAndSwitch Step-by-Step
-
-This is the canonical technique for exploiting arbitrary file write or file rename primitives
-in privileged services.
 
 ```
 SETUP (attacker):
@@ -523,67 +548,67 @@ SETUP (attacker):
   3. Request Filter oplock on C:\Temp\BaitDir\target.dll
 
 EXECUTION TIMELINE:
-  T0: Privileged service (SYSTEM) begins operation.
-      It opens or accesses C:\Temp\BaitDir\target.dll.
+  T0: Privileged service (SYSTEM) opens C:\Temp\BaitDir\target.dll
       ↓
   T1: Kernel fires oplock break notification to attacker.
-      The service's open call is BLOCKED — it does not proceed until
-      the attacker acknowledges the break.
+      Service's open call is BLOCKED.
 
   T2: Attacker receives break notification.
-      Attacker removes directory C:\Temp\BaitDir\
-      Attacker creates NTFS junction C:\Temp\BaitDir → C:\Windows\System32\
-      (BaitDir is now a junction point, not a real directory)
+      - Remove directory C:\Temp\BaitDir\
+      - Create NTFS junction C:\Temp\BaitDir → C:\Windows\System32\
 
-  T3: Attacker releases the oplock (acknowledges the break).
+  T3: Attacker releases the oplock.
 
-  T4: The blocked service operation resumes.
+  T4: Blocked service operation resumes.
       C:\Temp\BaitDir\target.dll now resolves to:
-        junction (C:\Temp\BaitDir) → C:\Windows\System32\
-        + target.dll
-        = C:\Windows\System32\target.dll
+        C:\Windows\System32\target.dll
       SYSTEM writes to C:\Windows\System32\target.dll
 
-  T5: Attacker plants a payload DLL at the redirected path.
-      Next privileged process to load target.dll executes attacker code.
+  T5: Attacker's DLL in System32 → next privileged load → code execution
 ```
 
-**The key insight:** The service does not re-validate the path after the oplock break. It holds
-an in-flight IRP that completes with the *new* resolution of the path, which now points to
-System32.
+**Key insight:** The service does not re-validate the path after the oplock break. It holds
+an in-flight IRP that completes with the *new* resolution of the path.
 
-### 8.4 From Arbitrary File Write to Full LPE
+### 8.4 In-the-Wild Oplock Exploitation (2024-2025)
 
-The canonical chain derived from Forshaw's research:
+Oplock-based techniques are **actively exploited by threat actors**:
+
+**CVE-2024-21338 (February 2024)** — `appid.sys` Windows AppLocker filter driver
+- Oplock-based race condition in IOCTL handler; missing re-validation after oplock break
+- **Exploited in the wild by Lazarus Group (North Korea)** to deliver malware
+- CVSS 7.8 — https://msrc.microsoft.com/update-guide/vulnerability/CVE-2024-21338
+
+**CVE-2024-30051 (May 2024)** — DWM Core Library
+- Desktop Window Manager — oplock-assisted arbitrary file write → LPE
+- **Zero-day exploited in the wild** by QakBot/Black Basta ransomware before patch
+- CVSS 7.8 — https://msrc.microsoft.com/update-guide/vulnerability/CVE-2024-30051
+
+**CVE-2024-38193 / CVE-2024-38014 (August 2024)**
+- AFD.sys driver and Windows Installer hard link abuse
+- Windows Installer (SYSTEM) follows hard links without validation → arbitrary file overwrite
+- Used by APT groups and ransomware for post-initial-access LPE
+
+### 8.5 From Arbitrary File Write to Full LPE
 
 ```
-INGREDIENT: A privileged service writes to a path that contains attacker-controlled
-            components (e.g., a service that creates/renames files in a temp directory
-            whose full path passes through user-writable parent directories)
-
 CHAIN:
-  1. Identify the privileged write:  Service SYSTEM writes to C:\ProgramData\Vendor\update.dll
-  2. Identify the race point:         Service validates the path, then writes
-  3. Plant bait:                      Oplock on C:\ProgramData\Vendor\update.dll
-  4. Wait for oplock break:           Service validates path → triggers oplock
-  5. Swap directory:                  Remove C:\ProgramData\Vendor\ (if we created it)
-                                      Create junction C:\ProgramData\Vendor\ → C:\Windows\System32\
-  6. Release oplock:                  Service continues → writes to System32\update.dll
-  7. DLL hijack:                      Update.dll is loaded by a SYSTEM process → LPE
+  1. Identify: Service SYSTEM writes to C:\ProgramData\Vendor\update.dll
+  2. Plant bait: Oplock on C:\ProgramData\Vendor\update.dll
+  3. Wait for oplock break: Service validates path → triggers oplock
+  4. Swap directory: junction C:\ProgramData\Vendor\ → C:\Windows\System32\
+  5. Release oplock: Service writes to System32\update.dll
+  6. DLL hijack: Update.dll loaded by SYSTEM process → LPE
 
-WINDOWS INSTALLER VARIANT:
-  If arbitrary write exists but no oplock race is needed:
-  1. Write a DLL to C:\Windows\System32\<dll>.dll
+WINDOWS INSTALLER REPAIR VARIANT (no oplock needed):
+  1. Write DLL to C:\Windows\System32\<dll>.dll via arbitrary write primitive
   2. Trigger msiexec /fau <MSI GUID> (Windows Installer repair)
   3. MSI repair loads DLLs in SYSTEM context → code execution
 ```
 
-### 8.5 Oplock APIs
+### 8.6 Oplock APIs
 
 ```c
-// Request a filter oplock on a file (Win7+ atomic oplock)
-// File must be opened with FILE_FLAG_OVERLAPPED and appropriate sharing
-
 REQUEST_OPLOCK_INPUT_BUFFER input = {
     .StructureVersion = REQUEST_OPLOCK_CURRENT_VERSION,
     .StructureLength  = sizeof(input),
@@ -601,13 +626,44 @@ DeviceIoControl(hFile,
     &overlapped);  // Async — completes when oplock breaks
 ```
 
-The `symboliclink-testing-tools` repository (Project Zero) provides `SetOpLock.exe` — a
-command-line tool that automates the oplock request and signals when the break fires, making
-the BaitAndSwitch timing manual and reliable during PoC development.
+`SetOpLock.exe` from `symboliclink-testing-tools` automates this for PoC development.
 
 ---
 
-## 9. Key WinDbg Commands for Object Manager Research
+## 9. Recent Developments (2024–2025)
+
+### 9.1 Actively Exploited CVEs
+
+| CVE | Component | Technique | Severity | Status |
+|---|---|---|---|---|
+| CVE-2024-21310 | Cloud Files Mini Filter (cldflt.sys) | Symbolic link following → arbitrary write | 7.8 | Patched Jan 2024 |
+| CVE-2024-26218 | Windows Kernel Object Manager | Namespace symlink manipulation → LPE | 7.8 | Patched Apr 2024 |
+| CVE-2024-30088 | Windows Kernel | TOCTOU race + hard link swap | 7.0 | Patched Jun 2024 |
+| CVE-2024-21338 | appid.sys (AppLocker) | Oplock race condition — exploited in wild (Lazarus) | 7.8 | Patched Feb 2024 |
+| CVE-2024-30051 | DWM Core Library | Oplock file write 0-day — exploited in wild (QakBot) | 7.8 | Patched May 2024 |
+| CVE-2024-38193 | AFD.sys | Hard link + SYSTEM file operation abuse | High | Patched Aug 2024 |
+| CVE-2025-21333 | Hyper-V NT Kernel Integration VSP | Object dir symlink chain — 0-day | Critical | Patched Jan 2025 |
+| CVE-2025-21334 | Hyper-V NT Kernel Integration VSP | Object manager namespace chain — 0-day | Critical | Patched Jan 2025 |
+| CVE-2025-21335 | Hyper-V NT Kernel Integration VSP | Related 0-day | Critical | Patched Jan 2025 |
+
+**CVE-2025-21333/34/35 — January 2025 Hyper-V 0-days:**
+Three Hyper-V VSP LPE vulnerabilities exploited in the wild before patch. Object directory symlink
+manipulation is part of the attack chain. Affects Windows 11 and Server 2025. Technical writeups
+from MSRC expected as disclosure timelines complete.
+
+### 9.2 Windows 11 24H2 / Server 2025 Namespace Hardening
+
+- **NTFS Symbolic Link Hardening:** Improved reparse point handling + ACL enforcement for
+  system-protected directories. Legacy compatibility mode retains some bypass vectors.
+- **Named pipe hardening (Server 2025):** Mandatory integrity level checks on pipe connections,
+  restricted anonymous pipe access, new ETW telemetry. SpecterOps and MDSec demoed bypasses
+  via ALPC callback abuse and undocumented `NtAlpcSendWaitReceivePort` parameters.
+- **VBS/HVCI enabled by default** on new 24H2 installations — kernel data structure tampering
+  prevented from user mode.
+
+---
+
+## 10. Key WinDbg Commands for Object Manager Research
 
 ```windbg
 ; ─── NAMESPACE NAVIGATION ───────────────────────────────────────────
@@ -618,79 +674,95 @@ the BaitAndSwitch timing manual and reliable during PoC development.
 !object \Sessions\1\BaseNamedObjects  ; per-session named objects
 
 ; ─── STRUCTURE INSPECTION ────────────────────────────────────────────
-dt nt!_OBJECT_HEADER <addr>     ; object header
-dt nt!_OBJECT_DIRECTORY <addr>  ; directory object (hash buckets)
-dt nt!_OBJECT_SYMBOLIC_LINK <addr>  ; symlink (LinkTarget UNICODE_STRING)
-dt nt!_DEVICE_MAP <addr>        ; device map structure
+dt nt!_OBJECT_HEADER <addr>
+dt nt!_OBJECT_DIRECTORY <addr>
+dt nt!_OBJECT_SYMBOLIC_LINK <addr>  ; LinkTarget UNICODE_STRING
+dt nt!_DEVICE_MAP <addr>
 
 ; ─── HANDLE OPERATIONS ───────────────────────────────────────────────
 !handle 0 7 <pid>               ; all handles in process with type/name
 !handle 0 7 0 File              ; all File handles in all processes
 !handle <value> f               ; full detail for one handle
+dt nt!_HANDLE_TABLE <EPROCESS.ObjectTable>
 
 ; ─── OBJECT TYPE TABLE ───────────────────────────────────────────────
 dt nt!ObpObjectTypes            ; array of _OBJECT_TYPE pointers
-dt nt!_OBJECT_TYPE <addr>       ; object type structure (TypeInfo, callbacks)
+dt nt!_OBJECT_TYPE <addr>
 
 ; ─── EPROCESS DEVICE MAP ─────────────────────────────────────────────
 dt nt!_EPROCESS <addr> DeviceMap
-!process 0 0 <name.exe>         ; find EPROCESS address by name
+!process 0 0 <name.exe>
 
 ; ─── DECODE TYPEINDEX ────────────────────────────────────────────────
-; header_addr = object_addr - 0x30
-; TypeIndex byte at header_addr + 0x18
-; ObHeaderCookie:
 ? nt!ObHeaderCookie
-; Decode:
+; header_addr = object_addr - 0x30, TypeIndex byte at header_addr + 0x18
 ? (poi(nt!ObHeaderCookie) & 0xff) ^ ((<hdr_addr> >> 8) & 0xff) ^ (by(<hdr_addr>+0x18) & 0xff)
 ```
 
 ---
 
-## 10. Research Methodology: Auditing the Object Namespace
+## 11. Research Methodology: Auditing the Object Namespace
 
 **Step 1: Enumerate writeable directories**
 ```powershell
-# Find namespace directories where current user can create objects
 Get-AccessibleObject -NtType Directory -Path \ -Recurse -AccessRights CreateObject |
   Format-Table Name, GrantedAccess
 ```
 
 **Step 2: Identify privileged name lookups**
-- Use Process Monitor (filter: Operation=RegOpenKey OR Operation=CreateFile, User=SYSTEM)
-- Focus on names that pass through directories where you have CreateObject rights
+ProcMon filter: `Operation=CreateFile, User=SYSTEM` — focus on paths through user-writable
+namespace directories.
 
-**Step 3: Check for OBJ_DONT_REPARSE**
-- Open the privileged binary in IDA/Ghidra
-- Find all `NtCreateFile`/`ZwCreateFile` call sites
-- Check the `Attributes` field passed in `OBJECT_ATTRIBUTES` for presence of `0x1000` (OBJ_DONT_REPARSE)
-- Absence when operating on user-influenced paths = vulnerability indicator
+**Step 3: Check for OBJ_DONT_REPARSE (0x1000)**
+In IDA/Ghidra: find all `NtCreateFile`/`ZwCreateFile` call sites. Check `OBJECT_ATTRIBUTES.Attributes`
+for `0x1000`. Absence on user-influenced paths = vulnerability indicator.
 
 **Step 4: Check for OBJ_IGNORE_IMPERSONATED_DEVICEMAP (0x2000)**
-- Find all code paths that call `NtCreateFile` after an impersonation call
-- Absence of `0x2000` in `Attributes` when operating on drive-letter paths under impersonation = vulnerability
+Find code paths calling `NtCreateFile` after an impersonation call. Absence of `0x2000` in
+Attributes when operating on drive-letter paths under impersonation = vulnerability.
 
-**Step 5: Build the exploit chain**
-- If the vulnerable operation is a file rename: BaitAndSwitch with junction swap
-- If it is a registry write: registry symlink redirect
-- If it is a named object lookup: object squatting
+**Step 5: Shadow directory enumeration**
+```powershell
+Import-Module NtObjectManager
+# Enumerate namespace looking for shadow directory relationships
+Get-NtDirectory -Path "\" | Get-NtDirectoryEntry | ForEach-Object {
+    if ($_.Object -is [NtApiDotNet.NtDirectory]) {
+        $sd = Get-NtSecurityDescriptor -Object $_.Object -ErrorAction SilentlyContinue
+        Write-Output "$($_.Name): $($sd?.Dacl?.Count) DACL entries"
+    }
+}
+```
+
+**Step 6: Build exploit chain**
+- File rename operation: BaitAndSwitch with junction swap
+- Registry write: registry symlink redirect  
+- Named object lookup: object squatting
+- Shadow directory available: plant shadow objects for privileged lookup redirection
 
 ---
 
 ## References
 
-[R-1] *Windows Internals, Part 1, Chapter 8: System Mechanisms — Object Manager* — Mark Russinovich, David Solomon, Alex Ionescu, Pavel Yosifovich — https://learn.microsoft.com/en-us/sysinternals/resources/windows-internals
+[R-1] *Windows Security Internals* — James Forshaw (No Starch Press, 2023) — https://nostarch.com/windows-security-internals
 
-[R-2] *Windows Security Internals* — James Forshaw (No Starch Press, 2023) — https://nostarch.com/windows-security-internals
+[R-2] *Windows Exploitation Tricks: Exploiting Arbitrary File Writes for Local Elevation of Privilege* — James Forshaw / Google Project Zero (2018) — https://googleprojectzero.blogspot.com/2018/04/windows-exploitation-tricks-exploiting.html
 
-[R-3] *Windows Exploitation Tricks: Exploiting Arbitrary File Writes for Local Elevation of Privilege* — James Forshaw / Google Project Zero — https://googleprojectzero.blogspot.com/2018/04/windows-exploitation-tricks-exploiting.html
+[R-3] *Windows Exploitation Tricks: Exploiting Arbitrary Object Directory Creation for LPE* — James Forshaw / Google Project Zero (2018) — https://googleprojectzero.blogspot.com/2018/08/windows-exploitation-tricks-exploiting.html
 
-[R-4] *symboliclink-testing-tools* — James Forshaw / Google Project Zero — https://github.com/googleprojectzero/symboliclink-testing-tools
+[R-4] *Abusing the NT Object Manager Namespace* — James Forshaw / DEF CON 25 (2017)
 
-[R-5] *sandbox-attacksurface-analysis-tools (NtObjectManager)* — James Forshaw / Google Project Zero — https://github.com/googleprojectzero/sandbox-attacksurface-analysis-tools
+[R-5] *symboliclink-testing-tools* — James Forshaw / Google Project Zero — https://github.com/googleprojectzero/symboliclink-testing-tools
 
-[R-6] *Windows Object Manager — Deep Technical Analysis* — Geoff Chappell — https://www.geoffchappell.com/studies/windows/km/ntoskrnl/api/ob/
+[R-6] *sandbox-attacksurface-analysis-tools (NtObjectManager)* — James Forshaw / Google Project Zero — https://github.com/googleprojectzero/sandbox-attacksurface-analysis-tools
 
-[R-7] *tiraniddo.dev — Symbolic Link, Object Manager, and Device Map Research Series* — James Forshaw — https://www.tiraniddo.dev/
+[R-7] *CVE-2024-21338 — Lazarus Group 0-day in appid.sys* — Avast Threat Intelligence — https://decoded.avast.io/
 
-[R-8] *WinObj* — Sysinternals / Microsoft — https://learn.microsoft.com/en-us/sysinternals/downloads/winobj
+[R-8] *CVE-2024-30051 — DWM 0-day exploited by QakBot/Black Basta* — MSRC — https://msrc.microsoft.com/update-guide/vulnerability/CVE-2024-30051
+
+[R-9] *CVE-2025-21333/334/335 — Hyper-V NT Kernel Integration 0-days* — MSRC — https://msrc.microsoft.com/update-guide/
+
+[R-10] *NtCreateSymbolicLinkObject Hardening Bypass (2024)* — itm4n — https://itm4n.github.io/
+
+[R-11] *tiraniddo.dev — Object Manager Research Series* — James Forshaw — https://www.tiraniddo.dev/
+
+[R-12] *Windows Object Manager — Deep Technical Analysis* — Geoff Chappell — https://www.geoffchappell.com/studies/windows/km/ntoskrnl/api/ob/

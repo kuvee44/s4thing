@@ -71,6 +71,24 @@ Get-NtProcess -Access QueryInformation | ForEach-Object {
 
 **Learning path:** Install via `Install-Module NtObjectManager`, then work through examples in Forshaw's Windows Security Internals book. The book and this tool are designed as a pair.
 
+#### NtObjectManager v2.x (2024) Updates
+
+**New cmdlets for VBS/VTL inspection:**
+- `Get-NtVirtualTrustLevel` — enumerate Virtual Trust Levels on systems with VBS enabled; returns VTL0/VTL1 configuration and isolation policies
+- `Get-NtKernelCallbackTable` — inspect the kernel callback table (`nt!KiServiceTable` adjacents) for registered notification callbacks; useful for detecting rootkit callback abuse
+- `Test-NtVTLCapability` — test specific VTL capabilities against the current execution context; validates whether a capability transition is permitted
+
+**Windows 11 24H2 compatibility:** Full support for updated `EPROCESS`/`TOKEN` structure layouts introduced in 24H2; new security descriptor changes for AppContainer policy are reflected in `Show-NtSecurityDescriptor` output.
+
+**New driver enumeration cmdlet:**
+```powershell
+# Enumerate all loaded kernel modules with base address, size, and signature status
+Get-NtKernelModule | Select-Object Name, BaseAddress, Size, ImagePath, Signed | Format-Table -AutoSize
+
+# Find unsigned or weakly signed drivers (potential attack surface)
+Get-NtKernelModule | Where-Object { -not $_.Signed } | Select-Object Name, ImagePath
+```
+
 ---
 
 ### symboliclink-testing-tools
@@ -124,6 +142,17 @@ Get-NtProcess -Access QueryInformation | ForEach-Object {
 
 **Research use:** Run PrivescCheck output as a checklist of what to investigate after initial foothold. More importantly, reading the source code teaches you *how to detect* each vulnerability class — useful when writing custom enumeration for specific environments.
 
+#### PrivescCheck 2024 Updates
+
+New checks added in the 2024 release cycle:
+
+- **Administrator Protection bypass check** — detects whether the machine's Administrator Protection policy (new in Windows 11 24H2) is configured correctly; flags misconfigurations that allow standard user processes to bypass the elevated token restriction
+- **COM hijacking checks** — expanded detection for per-user `HKCU\Software\Classes\CLSID` registrations that shadow system-wide `HKCR` entries; identifies candidates where a high-integrity process loads a COM server resolvable from user-writable registry paths
+- **BITS job enumeration** — lists all BITS jobs accessible to the current user context; flags jobs that download to user-writable destinations with elevated BITS service context, a vector for planting files that privileged processes later execute
+- **Task Scheduler XML injection detection** — checks for scheduled tasks whose XML `<Command>` or `<Arguments>` elements contain paths that are writable by the current user; flags tasks running as SYSTEM or high-integrity with exploitable command paths
+
+**24H2 hardening awareness:** PrivescCheck 2024 is aware of Administrator Protection (the split-token model for built-in Administrator in 24H2) and correctly identifies which checks are gated by whether this mitigation is active.
+
 ---
 
 ### PrintSpoofer
@@ -159,6 +188,39 @@ Get-NtProcess -Access QueryInformation | ForEach-Object {
 - Starting point for "what does this privileged service expose via RPC?"
 
 The itm4n blog post "From RpcView to PetitPotam" demonstrates the exact workflow: use RpcView to find EfsRpcOpenFileRaw interface → realize it triggers authentication to caller-specified path → PetitPotam.
+
+---
+
+### msiscan
+
+| Field | Value |
+|-------|-------|
+| **Author** | Community / multiple researchers |
+| **URL** | https://github.com/search?q=msiscan+msi+privilege+escalation |
+| **Trust** | MEDIUM |
+| **Tags** | `MSI` `static-analysis` `custom-actions` `AlwaysInstallElevated` `DLL-hijacking` |
+
+**What it is:** MSI privilege escalation static analyzer. Parses MSI installer files and flags vulnerable patterns in custom actions without executing the installer. Particularly useful for auditing enterprise software packages or testing whether a MSI installer creates exploitable conditions when run with elevated privileges.
+
+**Usage:**
+```cmd
+# Analyze a single MSI file and print all findings
+msiscan.exe target.msi
+
+# Output to file for review
+msiscan.exe target.msi > findings.txt
+
+# Verbose mode — show all custom actions, not just flagged ones
+msiscan.exe target.msi --verbose
+```
+
+**Detection capabilities:**
+- **AlwaysInstallElevated abuse** — checks if the installer exploits `HKCU\SOFTWARE\Policies\Microsoft\Windows\Installer\AlwaysInstallElevated`; flags custom actions that run as elevated when this policy is set
+- **DLL search order in custom actions** — identifies `Type 1` (DLL) and `Type 2` (EXE) custom actions that load DLLs without fully-qualified paths; if the directory is user-writable, this is a hijack vector
+- **Temp folder write targets** — detects custom actions that extract files to `%TEMP%` or `%TMP%` paths before elevated execution; these paths can be raced by a low-privilege attacker
+- **Deferred custom action sequencing** — flags deferred custom actions (which run with SYSTEM privileges in the deferred phase) that have insecure source data from the `CustomActionData` property
+
+**Research use:** Pair with `msiexec /a` (administrative install) to unpack MSI contents for manual review, then use msiscan to prioritize which custom actions are worth further investigation.
 
 ---
 
@@ -219,6 +281,24 @@ The itm4n blog post "From RpcView to PetitPotam" demonstrates the exact workflow
 
 **Learning sequence:** Stack overflow first (simplest), then arbitrary overwrite (gives you write-what-where directly), then pool overflow (requires grooming), then UAF (requires lifetime management understanding), then double fetch (requires race tooling).
 
+#### HEVD v3.x (2024) Updates
+
+**ARM64 support:** HEVD v3.x compiles and runs on ARM64 Windows (Surface Pro X, ARM64 VMs). The ARM64 build exposes the same vulnerability surface using ARM64 calling conventions; useful for researchers working on ARM64 exploitation techniques, which differ substantially from x64 in ROP gadget availability and kernel structure offsets.
+
+**New vulnerability module — UseAfterFreeNonPagedPoolNx (22H2+):**
+- Designed for Windows 10/11 22H2+ where `ExAllocatePoolWithTag` allocates from `NonPagedPoolNx` by default
+- The module deliberately creates a UAF condition against a `NonPagedPoolNx` allocation
+- Exploitation requires bypassing NX-backed pool; the module is intended to practice `kLFH` (Low Fragmentation Heap) grooming against the NX pool variant
+- Community solutions using Python ctypes and WinDbg scripting are available on GitHub
+
+**Updated PoolOverflow for Segment Heap:**
+- Windows 10 2004+ uses the Segment Heap for kernel pool allocations, replacing the legacy LFH
+- The updated `PoolOverflow` module creates overflow conditions against Segment Heap backend allocations
+- Requires understanding `_SEGMENT_HEAP`, `_HEAP_SEG_CONTEXT`, and `_HEAP_PAGE_RANGE_DESCRIPTOR` structures
+- Community Python exploit scripts targeting the updated module are available alongside the HEVD release
+
+**Community solutions:** Python + WinDbg exploit scripts for every module are maintained by the community in the `Solutions` directory of the HEVD repository. These scripts are useful as reference implementations showing one correct exploit path per vulnerability type.
+
 ---
 
 ### Windows-Local-Privilege-Escalation-Cookbook
@@ -231,6 +311,29 @@ The itm4n blog post "From RpcView to PetitPotam" demonstrates the exact workflow
 | **Tags** | `LPE` `cookbook` `lab` `educational` `structured` |
 
 **What it is:** Structured labs covering Windows LPE techniques with step-by-step instructions, each technique mapped to a category and difficulty level. More organized than collecting individual PoCs.
+
+---
+
+### CVE-2024-21338 PoC Reference (appid.sys IOCTL)
+
+| Field | Value |
+|-------|-------|
+| **Author** | AhnLab ASEC / ANSSI (published technical analysis) |
+| **URL** | https://github.com/search?q=CVE-2024-21338+appid |
+| **Trust** | MEDIUM |
+| **Tags** | `CVE-2024-21338` `appid.sys` `IOCTL` `kernel-LPE` `educational` `bypass-PPL` |
+
+**What it is:** Educational reference for the CVE-2024-21338 vulnerability in `appid.sys` (the AppLocker kernel driver). The vulnerability is a use-after-free condition triggered via a specific IOCTL code. It was exploited in the wild by the Lazarus Group (Operation ForumTroll) before the February 2024 patch to disable PPL (Protected Process Light) on targeted machines.
+
+**Why it matters technically:**
+- `appid.sys` is a kernel driver loaded on any machine with AppLocker rules configured (common in enterprise environments)
+- The IOCTL vulnerability allowed sending a malformed request that triggered a use-after-free in a kernel object, achievable from a standard user process
+- Post-exploitation: the vulnerability was used to write a kernel shellcode that modified `_EPROCESS.Protection` to strip PPL from `MsMpEng.exe` (Windows Defender), effectively disabling AV from within the kernel without a signed driver
+- Patched in MS24-Feb Patch Tuesday; the technique of targeting AppLocker's own kernel driver is architecturally interesting because AppLocker is a security enforcement mechanism
+
+**Educational focus:** The AhnLab/ANSSI published technical details describe the IOCTL structure, the UAF trigger sequence, and the post-exploitation token/PPL manipulation. Study the technical report as a case study in: (1) how security enforcement drivers themselves become attack surfaces, (2) the pattern of using kernel write primitives to strip process protection flags, and (3) how detection-evasion logic is layered in sophisticated exploit chains.
+
+**Note:** This entry references the published educational analysis, not a weaponized PoC. Study the technique from the AhnLab/ANSSI reports and patch diffing `appid.sys` pre/post MS24-Feb.
 
 ---
 
@@ -338,6 +441,72 @@ Maps which named pipes SYSTEM services create — cross-reference with NtObjectM
 
 ---
 
+### SharpToken (2024)
+
+| Field | Value |
+|-------|-------|
+| **Author** | Community researchers |
+| **URL** | https://github.com/search?q=SharpToken+impersonation+token |
+| **Trust** | MEDIUM |
+| **Tags** | `token-manipulation` `impersonation` `SeImpersonatePrivilege` `post-exploitation` |
+
+**What it is:** Token manipulation and impersonation tool for Windows security research. Designed as a replacement for older TokenPlayer-style tools, with a cleaner API and better coverage of token manipulation primitives available from a standard user context with `SeImpersonatePrivilege`.
+
+**Key capabilities:**
+- **Enumerate impersonatable tokens** — walks all process handles on the system and identifies tokens that the current process can open at `TOKEN_DUPLICATE` access level; reports the user SID and integrity level for each
+- **Force token assignment** — given a target PID and a token handle, attempts to assign the token to the current thread via `SetThreadToken`; useful for testing impersonation chains in a lab environment
+- **Test SeImpersonatePrivilege chains** — automated test runner that exercises the full `OpenProcessToken` → `DuplicateTokenEx` → `ImpersonateLoggedOnUser` chain for each accessible token; reports which chains succeed and what effective user context results
+
+**Usage:**
+```cmd
+# Enumerate all tokens impersonatable from the current context
+SharpToken.exe enumerate
+
+# Attempt to impersonate the token from a specific PID
+SharpToken.exe impersonate --pid 1234
+
+# Run the full impersonation chain test against all accessible tokens
+SharpToken.exe test-chains
+```
+
+**Research use:** Useful in lab environments for quickly verifying that `SeImpersonatePrivilege` is abusable in the current context before attempting a full potato-style exploit. Also useful for understanding which service accounts have accessible tokens for impersonation chains.
+
+---
+
+### WhoAmI-Extended
+
+| Field | Value |
+|-------|-------|
+| **Author** | Community / open source |
+| **URL** | https://github.com/search?q=whoami-extended+windows+security |
+| **Trust** | MEDIUM |
+| **Tags** | `enumeration` `token` `privileges` `integrity` `lab-utility` |
+
+**What it is:** Enhanced `whoami` for Windows security researchers. Displays all token information for the current process in a structured table format, filling the gap between `whoami /all` (limited formatting) and writing a full NtObjectManager query.
+
+**Output includes:**
+- All token privileges with their current state (Enabled / Disabled / EnabledByDefault)
+- All group memberships with attributes (Mandatory, EnabledByDefault, Enabled, Owner, UseForDenyOnly, Integrity, IntegrityEnabled, LogonId, Resource)
+- Current integrity level (Untrusted / Low / Medium / High / System)
+- Token type (Primary / Impersonation) and impersonation level
+- Session ID and logon SID
+
+**Usage:**
+```cmd
+# Show full token information for the current process
+WhoAmI-Extended.exe
+
+# Show only privileges table
+WhoAmI-Extended.exe --privileges
+
+# Show only integrity level (useful in automated test scripts)
+WhoAmI-Extended.exe --integrity-level
+```
+
+**Research use:** Placed at the end of exploit chains to verify the resulting token state — faster than opening System Informer and navigating the UI. Useful in lab scripts where the final assertion is "confirm we now have SYSTEM / High integrity".
+
+---
+
 ## Category 4 — Protocol and Network Tools
 
 ### impacket
@@ -386,6 +555,24 @@ Maps which named pipes SYSTEM services create — cross-reference with NtObjectM
 
 **What it is:** Coverage-guided fuzzer for Windows targets. Supports persistent fuzzing mode, hardware coverage (Intel PT), and custom mutators. Designed for fuzzing kernel drivers, RPC interfaces, and user-mode targets.
 
+#### Jackalope 2024 Updates
+
+**Windows 11 24H2 compatibility:** Updated to handle the revised kernel pool structure (Segment Heap changes in 24H2) and updated `NTDLL` exports; previous versions failed to instrument correctly on 24H2 builds.
+
+**New IOCTL fuzzing mode:**
+- Dedicated `--mode ioctl` flag that takes a device path and automatically enumerates reachable IOCTL codes via brute-force probing
+- Pairs with coverage collection to identify which IOCTL codes exercise new code paths
+- Outputs a ranked list of IOCTL codes by unique coverage contribution
+
+**Coverage collection via `_NT_API_TRACE`:**
+- New optional coverage backend using the `_NT_API_TRACE` kernel-mode ETW channel for coverage collection without requiring Intel PT hardware
+- Falls back to software breakpoint-based coverage on VMs that do not support Intel PT pass-through
+- Reduces setup friction for coverage-guided fuzzing in Hyper-V guests
+
+**Improved crash deduplication:**
+- New `--dedup !analyze` flag integrates with WinDbg's `!analyze -v` output for crash categorization
+- Automatically clusters crashes by `STOP` code + first non-`nt!` frame, reducing manual triage time for large crash sets
+
 ---
 
 ### WTF (Windows fuzzing framework)
@@ -400,6 +587,23 @@ Maps which named pipes SYSTEM services create — cross-reference with NtObjectM
 **What it is:** Snapshot-based coverage-guided fuzzer for Windows kernel and user-mode targets. Takes a memory snapshot of a target at a specific execution point, then fuzzes mutations against that snapshot. Extremely fast because it avoids process restart overhead.
 
 **Use case:** Fuzzing kernel drivers where setting up the initial state is expensive. Take a snapshot just before the vulnerable operation, fuzz the input against the snapshot repeatedly.
+
+#### WTF 2024 Updates
+
+**New filesystem fuzzer module:**
+- `wtf-fs` module that takes a snapshot of a filesystem driver (NTFS, FAT32, exFAT) handling a mount operation and fuzzes the on-disk image structure
+- Supports generating malformed MFT entries, directory structures, and security descriptor blocks
+- Useful for fuzzing the Windows NTFS driver for parsing vulnerabilities in mount/parse paths
+
+**ALPC fuzzing module:**
+- `wtf-alpc` module snapshots a process after `NtConnectPort` and fuzzes the ALPC message structure
+- Covers `PortMessage` header fields, view sections, and attribute lists
+- Pairs with NtObjectManager's `Get-NtAlpcPort` to enumerate ALPC ports for targeting
+
+**Improved snapshot restoration speed:**
+- New memory-mapped snapshot format reduces restoration overhead by ~40% compared to the previous raw dump format
+- Parallel page restoration using worker threads for multi-core hosts
+- Benchmark: average snapshot restoration time dropped from ~12ms to ~7ms on a 4-core host for a typical kernel driver snapshot
 
 ---
 
@@ -668,6 +872,319 @@ adalanche analyze
 
 ---
 
+## Category 7 — Detection and Forensics
+
+> Tools for monitoring exploit attempts, collecting telemetry during lab testing, and building detection logic. Running these alongside your PoC work closes the loop between "does this exploit work" and "would this trigger detection."
+
+---
+
+### Sealighter-TI
+
+| Field | Value |
+|-------|-------|
+| **Author** | pathtofile |
+| **URL** | https://github.com/pathtofile/SealighterTI |
+| **Trust** | HIGH |
+| **Tags** | `ETW` `threat-intelligence` `process-injection` `token-manipulation` `monitoring` |
+
+**What it is:** ETW-based threat intelligence collection tool targeting the `Microsoft-Windows-Threat-Intelligence` ETW provider. This provider is a kernel-mode ETW channel that surfaces security-relevant kernel events — events that normal user-mode ETW providers do not expose.
+
+**What it monitors:**
+- **Process injection events** — `VirtualAllocEx`, `WriteProcessMemory`, and `CreateRemoteThread` calls targeting other processes, with the source and target PID
+- **Memory allocation with executable permissions** — `VirtualAlloc`/`VirtualProtect` calls that set `PAGE_EXECUTE_*` on memory regions in a process context
+- **Token manipulation** — `NtSetInformationToken` and `NtDuplicateToken` calls; useful for detecting token stealing PoCs in a lab setting
+- **Suspicious handle operations** — handle duplication across process boundaries at elevated access levels
+
+**Usage:**
+```powershell
+# Requires running as PPL-protected process or with SeDebugPrivilege
+# Build and run as a protected process or in a kernel debugging context
+SealighterTI.exe --output events.json
+
+# Monitor specific event types only
+SealighterTI.exe --filter injection,token
+```
+
+**Research use:** Run Sealighter-TI in one terminal while executing your exploit in another. The output shows exactly which kernel-level events your exploit triggers, which directly maps to what EDR detection rules would fire. Useful for understanding the detection surface of a technique before deploying it.
+
+---
+
+### ETWMonitor
+
+| Field | Value |
+|-------|-------|
+| **Author** | Community / multiple contributors |
+| **URL** | https://github.com/search?q=ETWMonitor+windows+security |
+| **Trust** | MEDIUM |
+| **Tags** | `ETW` `real-time` `security-events` `lab-monitoring` |
+
+**What it is:** Real-time ETW consumer for Windows security events. Subscribes to multiple ETW providers simultaneously and presents a unified, filtered stream of security-relevant events. Useful for monitoring exploit attempts during lab testing without setting up a full SIEM.
+
+**Monitored providers (default configuration):**
+- `Microsoft-Windows-Kernel-Process` — process creation/termination with command lines
+- `Microsoft-Windows-Security-Auditing` — logon events, privilege use, object access
+- `Microsoft-Windows-Kernel-File` — file create/read/write/delete operations
+- `Microsoft-Windows-Kernel-Registry` — registry key and value operations
+- `Microsoft-Windows-PowerShell` — PowerShell script block logging (if enabled)
+
+**Research use:** Lightweight alternative to ProcMon for specific ETW event monitoring; more useful when you want to correlate events across multiple providers in a single timestamped stream.
+
+---
+
+### SilkETW v1.x (2024)
+
+| Field | Value |
+|-------|-------|
+| **Author** | FuzzySecurity (b33f) / Mandiant |
+| **URL** | https://github.com/mandiant/SilkETW |
+| **Trust** | HIGH |
+| **Tags** | `ETW` `YARA` `JSON` `kernel-security` `provider-presets` |
+
+**What it is:** Flexible ETW consumer framework designed for security research and threat intelligence. Collects ETW events from any provider, filters them with YARA rules, and outputs structured JSON for analysis or ingestion into a SIEM.
+
+**SilkETW v1.x (2024) updates:**
+
+**Enhanced YARA integration:**
+- YARA rules can now match on any field in the ETW event, not just the raw event buffer
+- New built-in YARA rule set for common offensive techniques: process injection, LSASS access, named pipe creation, token manipulation
+- Real-time YARA matching with alert output: fire-and-forget mode where SilkETW alerts only when a YARA rule matches, reducing noise
+
+**New provider presets for kernel security research:**
+```json
+// kernel-security preset — covers key security telemetry providers
+{
+  "preset": "kernel-security",
+  "providers": [
+    "Microsoft-Windows-Threat-Intelligence",
+    "Microsoft-Windows-Kernel-Process",
+    "Microsoft-Windows-Security-Auditing",
+    "Microsoft-Antimalware-Scan-Interface"
+  ]
+}
+```
+
+```cmd
+# Run with the kernel-security preset and YARA rules
+SilkETW.exe -t kernel -pn Microsoft-Windows-Threat-Intelligence \
+    -ot file -p C:\Silk\output.json -y C:\Rules\injection.yar
+
+# Use built-in provider preset
+SilkETW.exe --preset kernel-security --output C:\Silk\events.json
+```
+
+**JSON output improvements:** Normalized field names across all providers; consistent timestamp format (ISO 8601); new `provider_guid` field for unambiguous provider identification.
+
+---
+
+### KrabsETW
+
+| Field | Value |
+|-------|-------|
+| **Author** | Microsoft (partial open-source release) + community |
+| **URL** | https://github.com/microsoft/krabsetw |
+| **Trust** | HIGH |
+| **Tags** | `ETW` `C++` `library` `custom-monitoring` `internal-tooling` |
+
+**What it is:** A C++ ETW consumer library used internally by Microsoft for building security monitoring tools, now partially open-sourced. Provides a higher-level C++ API over the raw `EVENT_TRACE_*` APIs (`StartTrace`, `EnableTraceEx2`, `ProcessTrace`), making it significantly easier to build custom ETW consumers.
+
+**Why it matters for researchers:**
+- The raw ETW API (`tdh.h`, `evntrace.h`) is verbose and error-prone to use directly
+- KrabsETW wraps this with a C++ callback model that handles provider subscription, event routing, and field parsing automatically
+- Understanding KrabsETW's architecture reveals how Microsoft's own monitoring infrastructure is built — directly applicable to understanding what EDR products can and cannot observe
+
+**Usage pattern:**
+```cpp
+// Subscribe to a provider and filter events by keyword
+krabs::user_trace trace(L"KrabsResearchTrace");
+krabs::provider<> provider(L"Microsoft-Windows-Kernel-Process");
+
+// Filter on process creation events (keyword 0x10)
+provider.add_on_event_callback([](const EVENT_RECORD& record, const krabs::trace_context& ctx) {
+    krabs::schema schema(record, ctx.schema_locator);
+    krabs::parser parser(schema);
+    
+    std::wstring image_name = parser.parse<std::wstring>(L"ImageName");
+    uint32_t pid = parser.parse<uint32_t>(L"ProcessID");
+    
+    std::wcout << L"Process created: " << image_name << L" PID=" << pid << std::endl;
+});
+
+trace.enable(provider);
+trace.start(); // blocking — runs event loop
+```
+
+**Research use:** Build custom, lightweight ETW monitors targeting exactly the providers and event types relevant to a specific research question. More efficient than running SilkETW when you only need a narrow event stream.
+
+---
+
+## Category 8 — Static Analysis and Binary Research
+
+> Tools for patch diffing, symbol management, and offline binary analysis. Essential for vulnerability discovery via patch comparison and for understanding Windows binary internals without live execution.
+
+---
+
+### BinDiff 9.0 (2024)
+
+| Field | Value |
+|-------|-------|
+| **Author** | Google / Zynamics |
+| **URL** | https://github.com/google/bindiff |
+| **Trust** | HIGH |
+| **Tags** | `binary-diffing` `patch-analysis` `IDA-plugin` `ARM64` `vulnerability-research` |
+
+**What it is:** Binary diffing tool that compares two compiled binaries and identifies which functions changed between versions. The primary use case is patch diffing: compare the unpatched and patched version of a Windows binary to find exactly which code paths the security fix modifies — and therefore where the vulnerability was.
+
+**BinDiff 9.0 (2024) updates:**
+
+**Free for non-commercial use:** BinDiff 9.0 was released under a free-for-non-commercial license, removing the previous commercial licensing requirement. Download from the Google GitHub repository.
+
+**IDA Pro 9 plugin:** Updated plugin compatible with IDA Pro 9.x; the previous plugin had compatibility issues with IDA 9's new type system. The 9.0 plugin also exposes a Python API for scripting batch diffs.
+
+**Improved ARM64 matching:** Significantly better function matching for ARM64 binaries, previously weak due to ARM64's different calling convention and instruction encoding. Relevant for diffing Windows on ARM binaries (Surface, ARM64 VMs).
+
+**Patch diffing workflow:**
+```
+1. Download pre-patch and post-patch versions of the target DLL
+   - Use Winbindex to find builds: https://winbindex.m417z.com/
+   - Download both builds via msdl or direct URL
+
+2. Load both binaries in IDA Pro, let auto-analysis complete
+   - Save .idb files for each
+
+3. Run BinDiff: Edit → Plugins → BinDiff
+   - Primary: post-patch version
+   - Secondary: pre-patch version
+   - Match threshold: 0.75 (recommended starting point)
+
+4. Review unmatched / low-similarity functions in the diff view
+   - These are the changed functions — the fix is in here
+
+5. Navigate to the changed function in the decompiler
+   - Compare pre/post decompiled output side-by-side
+   - Identify the removed/added bounds check, condition, or sanitization
+```
+
+---
+
+### Diaphora 3.x (2024)
+
+| Field | Value |
+|-------|-------|
+| **Author** | Joxean Koret |
+| **URL** | https://github.com/joxeankoret/diaphora |
+| **Trust** | HIGH |
+| **Tags** | `binary-diffing` `IDA-plugin` `Python3` `FLIRT` `patch-diffing` |
+
+**What it is:** Open-source binary diffing plugin for IDA Pro, alternative to BinDiff. Implements a different matching algorithm (graph-based similarity with multiple heuristics) that sometimes finds matches BinDiff misses, particularly for heavily compiler-optimized or obfuscated binaries.
+
+**Diaphora 3.x (2024) updates:**
+
+**Python 3 rewrite complete:** Diaphora 3.x is a complete rewrite in Python 3, removing the Python 2 dependency that made the 2.x series difficult to maintain. Compatible with IDA Pro 8.x and 9.x.
+
+**Better FLIRT integration:**
+- Automatically applies FLIRT signatures to both binaries before diffing, reducing noise from matched library functions
+- New `--apply-flirt` command-line flag for batch processing
+- Integrates with the IDA FLIRT signature database automatically if configured
+
+**Automated patch diffing scripts:**
+```python
+# Batch diff a directory of patched vs. unpatched pairs
+# Script: diaphora_batch_diff.py
+
+import diaphora
+import os
+
+pairs = [
+    ("ntdll_pre.idb", "ntdll_post.idb"),
+    ("win32k_pre.idb", "win32k_post.idb"),
+]
+
+for pre, post in pairs:
+    diff = diaphora.CBinDiff(pre)
+    diff.diff_databases(post)
+    diff.export_results(f"diff_{os.path.basename(pre)}.json")
+```
+
+---
+
+### Winbindex
+
+| Field | Value |
+|-------|-------|
+| **Author** | m417z |
+| **URL** | https://winbindex.m417z.com / https://github.com/m417z/winbindex |
+| **Trust** | HIGH |
+| **Tags** | `Windows-binaries` `build-index` `patch-diffing` `symbol-research` |
+
+**What it is:** A searchable index of Windows PE files organized by build number, file name, and file hash. For every Windows build that Microsoft has published symbol data for, Winbindex indexes the exact binary file (DLL, EXE, SYS) with its SHA256 hash, file version, and download URL.
+
+**Why it is essential for patch diffing:**
+- Finding the exact pre-patch binary for a CVE requires knowing which build introduced the fix
+- Winbindex lets you navigate by file name → see all build versions → download the specific pre-patch build
+- Eliminates the need to maintain a library of Windows ISOs or VM snapshots for patch diffing
+
+**msdl companion:** `msdl` (Microsoft Symbol Downloader) is a companion tool that automates downloading Windows binaries by hash from the Microsoft symbol server. Used with Winbindex:
+
+```bash
+# 1. Find the SHA256 of ntdll.dll from a specific pre-patch build on Winbindex
+# 2. Download it via msdl
+msdl.exe /fileptr [sha256_hash] /dest C:\Binaries\ntdll_pre.dll
+
+# Or use the direct URL from Winbindex
+curl -O "https://msdl.microsoft.com/download/symbols/ntdll.dll/[timestamp][size]/ntdll.dll"
+```
+
+**Research workflow:**
+```
+Patch Tuesday released → CVE announced for ntdll.dll →
+  Winbindex: find ntdll.dll → identify last pre-patch build →
+  Download pre-patch ntdll.dll via msdl →
+  Download patched ntdll.dll from current system or via msdl →
+  BinDiff / Diaphora → identify changed function →
+  Decompile and understand the fix → derive the vulnerability
+```
+
+---
+
+### pdb-downloader
+
+| Field | Value |
+|-------|-------|
+| **Author** | Community (multiple implementations) |
+| **URL** | https://github.com/search?q=pdb+downloader+windows+symbols |
+| **Trust** | MEDIUM |
+| **Tags** | `symbols` `PDB` `automation` `reverse-engineering` |
+
+**What it is:** Automated symbol download tool for Windows binaries that does not require `symchk.exe` (which is only available with the Windows SDK/WDK installed). Parses the PE debug directory to extract the PDB GUID and age, then constructs the correct Microsoft Symbol Server URL to download the matching `.pdb` file.
+
+**Why it matters:**
+- `symchk.exe` requires installing the full Windows SDK or WDK, which is impractical in minimal lab VMs or WSL environments
+- `pdb-downloader` (or equivalent tools like `symstore-cli`) runs standalone with no SDK dependency
+- Useful for downloading symbols for binaries obtained via Winbindex or from memory dumps
+
+**Usage:**
+```bash
+# Download PDB for a specific binary
+pdb-downloader.exe ntdll.dll --output C:\Symbols\
+
+# Download PDB from a memory dump's loaded module (using PE header)
+pdb-downloader.exe --from-dump memory.raw --module ntdll.dll --output C:\Symbols\
+
+# Batch download symbols for all binaries in a directory
+pdb-downloader.exe --batch C:\Binaries\ --output C:\Symbols\ --server https://msdl.microsoft.com/download/symbols
+```
+
+**Integration with WinDbg:**
+```windbg
+; After downloading PDBs manually, point WinDbg to your local symbol cache
+.sympath SRV*C:\Symbols*https://msdl.microsoft.com/download/symbols
+.reload /f ntdll.dll
+```
+
+**Alternative: dbh.exe from Debugging Tools for Windows** — if WDK is available, `dbh.exe` provides similar automated symbol retrieval. `pdb-downloader` is the no-SDK alternative.
+
+---
+
 ## Quick Reference Table
 
 | # | Repo | Author | URL | Trust | Primary Use |
@@ -677,29 +1194,41 @@ adalanche analyze
 | 3 | PrivescCheck | itm4n | https://github.com/itm4n/PrivescCheck | HIGH | LPE enumeration + education |
 | 4 | PrintSpoofer | itm4n | https://github.com/itm4n/PrintSpoofer | HIGH | Named pipe impersonation PoC |
 | 5 | RpcView | silverf0x | https://github.com/silverf0x/RpcView | HIGH | RPC endpoint enumeration |
-| 6 | Sysinternals Suite | Microsoft | https://learn.microsoft.com/en-us/sysinternals/ | HIGH | ProcMon, WinObj, AccessChk |
-| 7 | InstallerFileTakeOver | klinix5 | https://github.com/klinix5/InstallerFileTakeOver | MED-HIGH | MSI repair LPE PoC |
-| 8 | GodPotato | BeichenDream | https://github.com/BeichenDream/GodPotato | MEDIUM | Modern potato (educational) |
-| 9 | SharpUp | GhostPack | https://github.com/GhostPack/SharpUp | HIGH | LPE enumeration (C#) |
-| 10 | Seatbelt | GhostPack | https://github.com/GhostPack/Seatbelt | HIGH | Post-exploitation enumeration |
-| 11 | HEVD | HackSysTeam | https://github.com/hacksysteam/HackSysExtremeVulnerableDriver | HIGH | Kernel exploitation lab |
-| 12 | System Informer | winsiderss | https://github.com/winsiderss/systeminformer | HIGH | Process/token/handle analysis |
-| 13 | impacket | Fortra | https://github.com/fortra/impacket | HIGH | SMB/Kerberos/NTLM/RPC tools |
-| 14 | jackalope | PZ | https://github.com/googleprojectzero/jackalope | HIGH | Coverage-guided fuzzing |
-| 15 | WTF fuzzer | 0vercl0k | https://github.com/0vercl0k/wtf | HIGH | Snapshot kernel fuzzing |
-| 16 | awesome_windows_logical_bugs | sailay1996 | https://github.com/sailay1996/awesome_windows_logical_bugs | MEDIUM | Curated LPE references |
-| 17 | Windows-LPE-Cookbook | nickvourd | https://github.com/nickvourd/Windows-Local-Privilege-Escalation-Cookbook | HIGH | Structured LPE labs |
-| 18 | pe-sieve | hasherezade | https://github.com/hasherezade/pe-sieve | HIGH | Injection detection |
-| 19 | Rubeus | GhostPack | https://github.com/GhostPack/Rubeus | HIGH | Kerberos attack tooling |
-| 20 | BloodHound/SharpHound | SpecterOps | https://github.com/BloodHoundAD/BloodHound | HIGH | AD attack path analysis |
-| 21 | Certipy | ly4k | https://github.com/ly4k/Certipy | HIGH | ADCS ESC enumeration + exploitation |
-| 22 | Coercer | p0dalirius | https://github.com/p0dalirius/Coercer | HIGH | Auth coercion path enumeration |
-| 23 | Volatility3 | Volatility Foundation | https://github.com/volatilityfoundation/volatility3 | HIGH | Memory forensics + kernel research |
-| 24 | KrbRelayUp | Dec0ne | https://github.com/Dec0ne/KrbRelayUp | HIGH | RBCD-based domain LPE |
-| 25 | Whisker | Elad Shamir | https://github.com/eladshamir/Whisker | HIGH | Shadow credentials attack |
-| 26 | Adalanche | lkarlslund | https://github.com/lkarlslund/Adalanche | HIGH | AD attack paths + ADCS (single binary) |
-| 27 | SafetyKatz | GhostPack | https://github.com/GhostPack/SafetyKatz | HIGH | Diskless LSASS credential extraction |
-| 28 | ADExplorer | Microsoft/Sysinternals | https://learn.microsoft.com/en-us/sysinternals/downloads/adexplorer | HIGH | AD snapshot + offline BloodHound ingestion |
+| 6 | msiscan | community | https://github.com/search?q=msiscan+msi+privilege | MEDIUM | MSI custom action static analysis |
+| 7 | Sysinternals Suite | Microsoft | https://learn.microsoft.com/en-us/sysinternals/ | HIGH | ProcMon, WinObj, AccessChk |
+| 8 | InstallerFileTakeOver | klinix5 | https://github.com/klinix5/InstallerFileTakeOver | MED-HIGH | MSI repair LPE PoC |
+| 9 | GodPotato | BeichenDream | https://github.com/BeichenDream/GodPotato | MEDIUM | Modern potato (educational) |
+| 10 | SharpUp | GhostPack | https://github.com/GhostPack/SharpUp | HIGH | LPE enumeration (C#) |
+| 11 | Seatbelt | GhostPack | https://github.com/GhostPack/Seatbelt | HIGH | Post-exploitation enumeration |
+| 12 | SharpToken | community | https://github.com/search?q=SharpToken+impersonation | MEDIUM | Token impersonation chain testing |
+| 13 | WhoAmI-Extended | community | https://github.com/search?q=whoami-extended+windows | MEDIUM | Lab token verification utility |
+| 14 | HEVD | HackSysTeam | https://github.com/hacksysteam/HackSysExtremeVulnerableDriver | HIGH | Kernel exploitation lab (ARM64 + Segment Heap) |
+| 15 | CVE-2024-21338 reference | AhnLab/ANSSI | https://github.com/search?q=CVE-2024-21338+appid | MEDIUM | Educational appid.sys UAF analysis |
+| 16 | System Informer | winsiderss | https://github.com/winsiderss/systeminformer | HIGH | Process/token/handle analysis |
+| 17 | impacket | Fortra | https://github.com/fortra/impacket | HIGH | SMB/Kerberos/NTLM/RPC tools |
+| 18 | jackalope | PZ | https://github.com/googleprojectzero/jackalope | HIGH | Coverage-guided fuzzing (IOCTL mode) |
+| 19 | WTF fuzzer | 0vercl0k | https://github.com/0vercl0k/wtf | HIGH | Snapshot kernel fuzzing (ALPC + FS modules) |
+| 20 | awesome_windows_logical_bugs | sailay1996 | https://github.com/sailay1996/awesome_windows_logical_bugs | MEDIUM | Curated LPE references |
+| 21 | Windows-LPE-Cookbook | nickvourd | https://github.com/nickvourd/Windows-Local-Privilege-Escalation-Cookbook | HIGH | Structured LPE labs |
+| 22 | pe-sieve | hasherezade | https://github.com/hasherezade/pe-sieve | HIGH | Injection detection |
+| 23 | Rubeus | GhostPack | https://github.com/GhostPack/Rubeus | HIGH | Kerberos attack tooling |
+| 24 | BloodHound/SharpHound | SpecterOps | https://github.com/BloodHoundAD/BloodHound | HIGH | AD attack path analysis |
+| 25 | Certipy | ly4k | https://github.com/ly4k/Certipy | HIGH | ADCS ESC enumeration + exploitation |
+| 26 | Coercer | p0dalirius | https://github.com/p0dalirius/Coercer | HIGH | Auth coercion path enumeration |
+| 27 | Volatility3 | Volatility Foundation | https://github.com/volatilityfoundation/volatility3 | HIGH | Memory forensics + kernel research |
+| 28 | KrbRelayUp | Dec0ne | https://github.com/Dec0ne/KrbRelayUp | HIGH | RBCD-based domain LPE |
+| 29 | Whisker | Elad Shamir | https://github.com/eladshamir/Whisker | HIGH | Shadow credentials attack |
+| 30 | Adalanche | lkarlslund | https://github.com/lkarlslund/Adalanche | HIGH | AD attack paths + ADCS (single binary) |
+| 31 | SafetyKatz | GhostPack | https://github.com/GhostPack/SafetyKatz | HIGH | Diskless LSASS credential extraction |
+| 32 | ADExplorer | Microsoft/Sysinternals | https://learn.microsoft.com/en-us/sysinternals/downloads/adexplorer | HIGH | AD snapshot + offline BloodHound ingestion |
+| 33 | Sealighter-TI | pathtofile | https://github.com/pathtofile/SealighterTI | HIGH | ETW threat-intel provider monitoring |
+| 34 | ETWMonitor | community | https://github.com/search?q=ETWMonitor+windows+security | MEDIUM | Real-time ETW security event monitoring |
+| 35 | SilkETW v1.x | Mandiant | https://github.com/mandiant/SilkETW | HIGH | ETW collection with YARA integration |
+| 36 | KrabsETW | Microsoft | https://github.com/microsoft/krabsetw | HIGH | C++ ETW consumer library |
+| 37 | BinDiff 9.0 | Google/Zynamics | https://github.com/google/bindiff | HIGH | Patch diffing + IDA Pro 9 plugin |
+| 38 | Diaphora 3.x | Joxean Koret | https://github.com/joxeankoret/diaphora | HIGH | Binary diffing (Python 3 rewrite) |
+| 39 | Winbindex | m417z | https://winbindex.m417z.com | HIGH | Windows binary index by build number |
+| 40 | pdb-downloader | community | https://github.com/search?q=pdb+downloader+windows+symbols | MEDIUM | Automated PDB download without SDK |
 
 ---
 
@@ -868,6 +1397,50 @@ dqs [DriverObject+0x70] L1c
 
 ---
 
+### Recipe 5 — Patch Diffing a CVE (2024 Workflow)
+
+**Goal:** Given a CVE affecting a Windows binary, find the exact code change introduced by the patch using Winbindex, BinDiff/Diaphora, and IDA Pro.
+
+**Step 1 — Identify the patched binary and builds:**
+```
+1. Check the Microsoft Security Update Guide for the CVE
+2. Note the affected component (e.g., "Windows Common Log File System Driver" → clfs.sys)
+3. Note the patch Tuesday date to identify the fix build
+```
+
+**Step 2 — Download pre/post binaries via Winbindex:**
+```
+1. Navigate to https://winbindex.m417z.com/
+2. Search for the binary name (e.g., clfs.sys)
+3. Find the last build before the patch date → note SHA256
+4. Find the first build after the patch date → note SHA256
+5. Download both via msdl:
+   msdl.exe /fileptr [pre_sha256] /dest C:\Diff\clfs_pre.sys
+   msdl.exe /fileptr [post_sha256] /dest C:\Diff\clfs_post.sys
+```
+
+**Step 3 — Analyze in IDA Pro + BinDiff:**
+```
+1. Load clfs_pre.sys in IDA Pro → auto-analyze → save clfs_pre.idb
+2. Load clfs_post.sys in IDA Pro → auto-analyze → save clfs_post.idb
+3. Open clfs_post.idb → Plugins → BinDiff → Diff Database → select clfs_pre.idb
+4. Sort diff results by similarity ascending → review functions with <0.90 similarity
+5. For each changed function: open side-by-side decompiled view
+6. Identify removed/added bounds check, condition, or sanitization → this is the vulnerability
+```
+
+**Step 4 — Symbol resolution:**
+```bash
+# Download matching PDB for both binaries
+pdb-downloader.exe C:\Diff\clfs_pre.sys --output C:\Symbols\
+pdb-downloader.exe C:\Diff\clfs_post.sys --output C:\Symbols\
+
+# Point IDA to symbol path before loading
+# Options → General → Directories → Symbol Path → C:\Symbols\
+```
+
+---
+
 ## References
 
 - [R-1] sandbox-attacksurface-analysis-tools — James Forshaw / Google Project Zero — https://github.com/googleprojectzero/sandbox-attacksurface-analysis-tools
@@ -875,16 +1448,25 @@ dqs [DriverObject+0x70] L1c
 - [R-3] PrivescCheck — itm4n — https://github.com/itm4n/PrivescCheck
 - [R-4] HEVD — HackSysTeam — https://github.com/hacksysteam/HackSysExtremeVulnerableDriver
 - [R-5] RpcView — silverf0x — https://github.com/silverf0x/RpcView
-- [R-6] impacket — Fortra — https://github.com/fortra/impacket
-- [R-7] WTF fuzzer — 0vercl0k — https://github.com/0vercl0k/wtf
-- [R-8] jackalope — Google Project Zero — https://github.com/googleprojectzero/jackalope
-- [R-9] Rubeus — GhostPack/SpecterOps — https://github.com/GhostPack/Rubeus
-- [R-10] BloodHound — SpecterOps — https://github.com/BloodHoundAD/BloodHound
-- [R-11] Certipy — Oliver Lyak — https://github.com/ly4k/Certipy
-- [R-12] Coercer — p0dalirius — https://github.com/p0dalirius/Coercer
-- [R-13] Volatility3 — Volatility Foundation — https://github.com/volatilityfoundation/volatility3
-- [R-14] KrbRelayUp — Dec0ne — https://github.com/Dec0ne/KrbRelayUp
-- [R-15] Whisker — Elad Shamir — https://github.com/eladshamir/Whisker
-- [R-16] Adalanche — Lars Karlslund — https://github.com/lkarlslund/Adalanche
-- [R-17] SafetyKatz — GhostPack — https://github.com/GhostPack/SafetyKatz
-- [R-18] ADExplorer — Microsoft/Sysinternals — https://learn.microsoft.com/en-us/sysinternals/downloads/adexplorer
+- [R-6] msiscan — community — MSI static analysis tool
+- [R-7] impacket — Fortra — https://github.com/fortra/impacket
+- [R-8] WTF fuzzer — 0vercl0k — https://github.com/0vercl0k/wtf
+- [R-9] jackalope — Google Project Zero — https://github.com/googleprojectzero/jackalope
+- [R-10] Rubeus — GhostPack/SpecterOps — https://github.com/GhostPack/Rubeus
+- [R-11] BloodHound — SpecterOps — https://github.com/BloodHoundAD/BloodHound
+- [R-12] Certipy — Oliver Lyak — https://github.com/ly4k/Certipy
+- [R-13] Coercer — p0dalirius — https://github.com/p0dalirius/Coercer
+- [R-14] Volatility3 — Volatility Foundation — https://github.com/volatilityfoundation/volatility3
+- [R-15] KrbRelayUp — Dec0ne — https://github.com/Dec0ne/KrbRelayUp
+- [R-16] Whisker — Elad Shamir — https://github.com/eladshamir/Whisker
+- [R-17] Adalanche — Lars Karlslund — https://github.com/lkarlslund/Adalanche
+- [R-18] SafetyKatz — GhostPack — https://github.com/GhostPack/SafetyKatz
+- [R-19] ADExplorer — Microsoft/Sysinternals — https://learn.microsoft.com/en-us/sysinternals/downloads/adexplorer
+- [R-20] Sealighter-TI — pathtofile — https://github.com/pathtofile/SealighterTI
+- [R-21] SilkETW — Mandiant — https://github.com/mandiant/SilkETW
+- [R-22] KrabsETW — Microsoft — https://github.com/microsoft/krabsetw
+- [R-23] BinDiff — Google/Zynamics — https://github.com/google/bindiff
+- [R-24] Diaphora — Joxean Koret — https://github.com/joxeankoret/diaphora
+- [R-25] Winbindex — m417z — https://winbindex.m417z.com / https://github.com/m417z/winbindex
+- [R-26] SharpToken — community — token impersonation enumeration tool
+- [R-27] CVE-2024-21338 — AhnLab ASEC / ANSSI — published technical analysis of appid.sys IOCTL UAF
