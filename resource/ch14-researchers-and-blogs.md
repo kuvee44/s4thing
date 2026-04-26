@@ -4,6 +4,8 @@
 >
 > The structure is deliberately asymmetric: researchers with deep, analyzable methodology arcs get full sections. Those with narrower or more recent catalogs get compressed coverage. Depth is proportional to methodological density, not to fame.
 
+> **Navigation:** Researcher profiles link to their relevant work covered in: ch13 (CVE case studies), ch16 (talks), ch15 (tools they maintain).
+
 ---
 
 ## Tier 1 — Core Windows Security Research
@@ -92,6 +94,8 @@ GitHub: https://github.com/googleprojectzero/sandbox-attacksurface-analysis-tool
 
 New cmdlets in the 2024 release cycle add VTL (Virtual Trust Level) inspection capabilities: `Get-NtVirtualTrustLevel`, `Get-NtSecureKernelObject`, and updated `Get-NtToken` that reports Isolated LSA token provenance. Useful for mapping the VTL0/VTL1 attack surface and understanding what Secure World objects are exposed to normal kernel mode.
 
+> **Forshaw's tools:** ch15 §Cat1 (NtObjectManager, sandbox-attacksurface-analysis-tools). **His talks:** ch16 §Tier1 (Object Manager talk).
+
 ---
 
 ### itm4n (Clément Labro)
@@ -175,6 +179,8 @@ A multi-post series examining how the JIT token mechanism for Administrator Prot
 **PPL Process Enumeration with NtObjectManager (collaboration with Forshaw)**
 
 itm4n demonstrated how NtObjectManager's `Get-NtProcess -Access 0` combined with `Get-NtProcessMitigationPolicy` provides a complete enumeration of PPL-protected process levels without requiring any elevated privileges. The technique reads publicly accessible kernel object attributes to map the PPL level (`PS_PROTECTED_TYPE`, `PS_PROTECTED_SIGNER`) of every running process — useful for pre-exploitation reconnaissance to understand which LSASS protection level is in play.
+
+> **itm4n's tools:** ch15 §Cat1 (PrivescCheck), ch15 §Cat3 (SharpToken). **His CVEs:** ch13 §13.5 (PrintSpoofer), ch08 §6 (WinSxS DLL planting).
 
 ---
 
@@ -975,40 +981,33 @@ Do not read individual blog posts in isolation. When starting a new researcher, 
 
 ## References
 
-- [R-1] tiraniddo.dev — James Forshaw — https://www.tiraniddo.dev/
-- [R-2] Google Project Zero Blog — https://googleprojectzero.blogspot.com/
-- [R-3] sandbox-attacksurface-analysis-tools — Forshaw/Project Zero — https://github.com/googleprojectzero/sandbox-attacksurface-analysis-tools
-- [R-4] Windows Security Internals — Forshaw, No Starch 2023 — https://nostarch.com/windows-security-internals
-- [R-5] itm4n.github.io — Clément Labro — https://itm4n.github.io/
-- [R-6] PrivescCheck — itm4n — https://github.com/itm4n/PrivescCheck
-- [R-7] decoder.cloud — Antonio Cocomazzi — https://decoder.cloud/
-- [R-8] RoguePotato PoC — antonioCoco — https://github.com/antonioCoco/RoguePotato
-- [R-9] j00ru.vexillium.org — Mateusz Jurczyk — https://j00ru.vexillium.org/
-- [R-10] NT/Win32k syscall tables — j00ru — https://j00ru.vexillium.org/syscalls/nt/
-- [R-11] windows-internals.com — Shafir / Ionescu / Yosifovich — https://windows-internals.com/
-- [R-12] I/O Ring exploitation — Yarden Shafir — https://windows-internals.com/one-io-ring-to-rule-them-all-a-new-attack-primitive-on-windows-11/
-- [R-13] connormcgarr.github.io — Connor McGarr — https://connormcgarr.github.io/
-- [R-14] Project Zero Issue Tracker (Windows) — https://bugs.chromium.org/p/project-zero/issues/list?q=windows
-- [R-15] MSRC Acknowledgments — https://msrc.microsoft.com/update-guide/acknowledgement
-- [R-16] blog.harmj0y.net — Will Schroeder — https://blog.harmj0y.net/
-- [R-17] Rubeus — GhostPack — https://github.com/GhostPack/Rubeus
-- [R-18] Certified Pre-Owned — Schroeder/Robbins — https://posts.specterops.io/certified-pre-owned-d95910965cd2
-- [R-19] Wagging the Dog — Elad Shamir — https://shenaniganslabs.io/2019/01/28/Wagging-the-Dog.html
-- [R-20] Whisker (shadow credentials) — Elad Shamir — https://github.com/eladshamir/Whisker
-- [R-21] Diamond Tickets — Charlie Clark — https://exploit.ph/diamond-tickets.html
-- [R-22] An ACE Up the Sleeve — Robbins/Schroeder — https://www.blackhat.com/docs/us-17/wednesday/us-17-Robbins-An-ACE-Up-The-Sleeve-Designing-Active-Directory-DACL-Backdoors-wp.pdf
-- [R-23] hasherezade GitHub — https://github.com/hasherezade
-- [R-24] pe-sieve — hasherezade — https://github.com/hasherezade/pe-sieve
-- [R-25] Mimikatz — Benjamin Delpy — https://github.com/gentilkiwi/mimikatz
-- [R-26] Elastic Security Labs — https://www.elastic.co/security-labs/
-- [R-27] Synacktiv publications — https://www.synacktiv.com/publications.html
-- [R-28] BloodHound — SpecterOps — https://github.com/BloodHoundAD/BloodHound
-- [R-29] "The COM-Back" — Forshaw, Project Zero — https://googleprojectzero.blogspot.com/2025/01/the-com-back.html
-- [R-30] CVE-2025-21204 writeup — itm4n — https://itm4n.github.io/cve-2025-21204-windows-update-installer-symlink/
-- [R-31] NtObjectManager v2.x (VTL inspection) — Forshaw/P0 — https://github.com/googleprojectzero/sandbox-attacksurface-analysis-tools
-- [R-32] SafeBreach Labs research — https://www.safebreach.com/research/
-- [R-33] Zscaler ThreatLabz — https://www.zscaler.com/blogs/security-research
-- [R-34] ESET Research / WeLiveSecurity — https://www.welivesecurity.com/
-- [R-35] Kaspersky GReAT / Securelist — https://securelist.com/
-- [R-36] Trend Micro Zero Day Initiative blog — https://www.zerodayinitiative.com/blog/
+[R-1] James Forshaw (tiranid) — GitHub: https://github.com/tyranid | Blog: https://tyranid.github.io/
+
+[R-2] itm4n (Clément Labro) — Blog: https://itm4n.github.io/ | GitHub: https://github.com/itm4n
+
+[R-3] decoder (Antonio Cocomazzi) — Blog: https://decoder.cloud/ | GitHub: https://github.com/antonioCoco
+
+[R-4] j00ru (Mateusz Jurczyk) — Blog: https://j00ru.vexillium.org/ | GitHub: https://github.com/j00ru
+
+[R-5] Yarden Shafir — Blog: https://windows-internals.com/ | Twitter: @yarden_shafir
+
+[R-6] Alex Ionescu — Blog: https://www.alex-ionescu.com/ | GitHub: https://github.com/ionescu007
+
+[R-7] Connor McGarr — Blog: https://connormcgarr.github.io/
+
+[R-8] Google Project Zero — Blog: https://googleprojectzero.blogspot.com/ | GitHub: https://github.com/googleprojectzero
+
+[R-9] SafeBreach Labs — Blog: https://www.safebreach.com/blog/
+
+[R-10] Zscaler ThreatLabz — Blog: https://www.zscaler.com/blogs/security-research
+
+[R-11] ESET Research — WeLiveSecurity: https://www.welivesecurity.com/
+
+[R-12] Elastic Security Research — Blog: https://www.elastic.co/security-labs/
+
+[R-13] Kaspersky GReAT — Securelist: https://securelist.com/
+
+[R-14] Microsoft MSTIC — Security Blog: https://www.microsoft.com/en-us/security/blog/topic/threat-intelligence/
+
+[R-15] Synacktiv — Blog: https://www.synacktiv.com/en/publications
 - [R-37] Microsoft MSTIC — https://www.microsoft.com/security/blog/topic/microsoft-threat-intelligence/

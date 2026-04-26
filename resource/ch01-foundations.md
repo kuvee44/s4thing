@@ -84,6 +84,8 @@ or a VTL 1 escape rather than simply writing shellcode to a kernel buffer.
 **Windows 11 24H2 (Build 26100, October 2024) changes:** HVCI is now enabled by default on all
 new installs with compatible hardware. For the impact on exploit development, see Section 8.
 
+> **Deep dive:** ch03 §9 covers Administrator Protection built on VTL. ch10 §10.11 covers in-wild exploitation of VTL0→VTL1 escape (CVE-2025-21333).
+
 ### Software Privilege Layers Within Ring 3
 
 Below the hardware ring boundary, Windows enforces additional layers entirely in software:
@@ -245,6 +247,8 @@ impersonation token first. If the thread is not impersonating (ThreadToken is NU
 back to the process token. This is why impersonation attacks work: if you can set the thread
 token to a SYSTEM-level impersonation token, the thread operates as SYSTEM for the duration of
 that operation, without modifying the process token (which would be globally visible).
+
+> **Exploitation context:** ch09 §3.9 shows how a 1-byte PreviousMode overwrite exploits _KTHREAD. ch10 §10.10 shows how FudModule reads EPROCESS.Token for token stealing.
 
 ```windbg
 ; Dump current thread
@@ -520,6 +524,8 @@ For segment-heap targets with 2024 type isolation, the grooming must respect typ
 drain and spray with objects of the same type as the victim to land in the same segment. Commonly
 targeted objects for grooming: `_OBJECT_TYPE_INITIALIZER` (contains function pointer table),
 lookaside list entries, or the token structure itself.
+
+> **See also:** ch10 §10.1–10.5 for full Segment Heap exploitation workflow. ch08 §8 for pool corruption bug class overview.
 
 ---
 
@@ -1008,6 +1014,8 @@ attacking the EDR driver itself.
 
 **Reference:** https://decoded.avast.io/janvojtesek/lazarus-and-the-fudmodule-rootkit-beyond-byovd-with-an-admin-to-kernel-zero-day
 
+> **Full exploit chain:** ch13 §13.10. **Variant hunting:** ch12 §11. **Callback table layout:** ch10 §10.10.
+
 ### 9.3 Vulnerable Driver Blocklist — Auto-Update (2024)
 
 The Microsoft Recommended Driver Block Rules list (`wdac_policy.xml`) was significantly expanded
@@ -1178,7 +1186,9 @@ dps nt!PsCreateProcessNotifyRoutine L 8   ; process create callbacks
 
 [R-10] *Microsoft Recommended Driver Block Rules* — Windows App Control for Business documentation — https://learn.microsoft.com/en-us/windows/security/application-security/application-control/app-control-for-business/design/microsoft-recommended-driver-block-rules
 
-[R-11] *Windows 11 24H2 VBS and HVCI Enforcement Changes* — Microsoft Security Blog — https://www.microsoft.com/en-us/security/blog/
+[R-11] *Microsoft Pluton and VBS Improvements in Windows 11 24H2* — Microsoft Security Blog — https://www.microsoft.com/en-us/security/blog/2024/09/24/advancing-windows-security/
+
+[R-12b] *Hypervisor-Protected Code Integrity (HVCI)* — Microsoft Docs — https://learn.microsoft.com/en-us/windows-hardware/drivers/bringup/device-guard-and-credential-guard
 
 [R-12] *Virtualization-Based Security (VBS) Overview* — Microsoft Docs — https://learn.microsoft.com/en-us/windows-hardware/design/device-experiences/oem-vbs
 

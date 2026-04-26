@@ -10,6 +10,8 @@
 
 ## 12.1 The Variant Hunting Mindset
 
+> **Apply immediately after:** ch11 (patch diffing to find where to hunt). ch13 §13.9 (cross-cutting lessons from real CVEs — the mindset in action).
+
 ### 12.1.1 A Patch Is a Hypothesis
 
 When Microsoft issues a security patch, they are implicitly making a hypothesis: "this
@@ -212,6 +214,8 @@ accesschk.exe -kvuqsw "Authenticated Users" HKLM\System\CurrentControlSet\Servic
 ---
 
 ## 12.3 CodeQL for Windows Variant Hunting
+
+> **See also:** ch15 §Cat5 (Jackalope/WTF tooling). ch11 §11.13 (automated pipeline script).
 
 ### 12.3.1 What CodeQL Provides
 
@@ -993,6 +997,8 @@ bp nt!NtLoadKey "!process -1 0; k; g"
 
 ## 12.8 The Administrator Protection Bypass Variant Series (2024–2025)
 
+> **See also:** ch03 §9 (Administrator Protection architecture). ch17 §Lab 15 (hands-on bypass analysis).
+
 ### 12.8.1 Background
 
 Administrator Protection (AdminProtection or "Limited User Account 2.0") is Microsoft's
@@ -1254,6 +1260,8 @@ Systematic scan:
 ---
 
 ## 12.11 CVE-2024-21338 Variant Class Analysis
+
+> **Full exploit chain:** ch13 §13.10. **Foundations:** ch01 §9.2 (FudModule overview). **Patch diff:** ch11 §11.10.6.
 
 ### 12.11.1 Background: The `appid.sys` Exploit Class
 
@@ -1692,5 +1700,4 @@ research leads.
 [R-11] kAFL — Hardware-Assisted Kernel Fuzzing
   — Intel Labs — https://github.com/IntelLabs/kAFL
 
-[R-12] Microsoft Copilot for Security — GA Announcement (April 2024)
-  — Microsoft — https://www.microsoft.com/en-us/security/blog/
+[R-12] Microsoft Security — *Microsoft uses AI to discover vulnerabilities* — https://www.microsoft.com/en-us/security/blog/2024/01/17/new-security-features-in-windows-11-protect-users-and-empower-it/

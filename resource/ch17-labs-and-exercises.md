@@ -57,6 +57,8 @@ git clone https://github.com/googleprojectzero/symboliclink-testing-tools
 git clone https://github.com/googleprojectzero/sandbox-attacksurface-analysis-tools
 ```
 
+> **Tool references:** All tools listed here are documented in detail in ch15. Debugging setup covered in ch02.
+
 ### Safety Rules
 
 1. **Isolation first.** Exploit code runs only in VMs with no network connection to production systems.
@@ -88,6 +90,8 @@ Tier 6: Variant Hunting     → COM enumeration, PrivescCheck + custom follow-up
 ---
 
 ## Tier 1 — Fundamentals (Labs 1–5)
+
+> **Background reading:** ch01 (foundations), ch02 (debugging setup).
 
 ### Lab 1 — WinDbg Kernel Debugging Setup (KDNET)
 
@@ -289,6 +293,8 @@ Get-NtProcess | Where-Object {
 
 ## Tier 2 — Security Model (Labs 6–8)
 
+> **Background reading:** ch03 (security model), ch04 (object manager).
+
 ### Lab 6 — NtObjectManager: ACL Analysis and Weak Permission Discovery
 
 **Objective:** Use NtObjectManager to systematically find objects with DACLs that allow low-privilege write.
@@ -371,6 +377,8 @@ accesschk.exe -kd HKLM\SOFTWARE
 ---
 
 ## Tier 3 — Bug Class Reproduction (Labs 9–15)
+
+> **Background reading:** ch08 (bug classes), ch06 (filesystem), ch07 (services).
 
 > Labs 9–13 cover foundational bug class reproduction. Labs 14–15 (added 2024–2025) cover CVE-2024-49039 style RPC/AppContainer boundary violations and the CVE-2025-21204 pattern for Administrator Protection bypass.
 
@@ -586,6 +594,8 @@ foreach ($pipe in $pipes) {
 
 ## Tier 4 — Kernel Exploitation (Labs 16–20)
 
+> **Background reading:** ch10 (kernel/Win32k), ch09 (primitives).
+
 > Labs 16–17 cover HEVD x64 exploitation. Labs 18–20 (added 2024–2025) cover ARM64 exploitation, kernel callback analysis (FudModule technique), and WNF-based information disclosure.
 
 ### Lab 16 — HEVD Setup and Stack Overflow
@@ -794,6 +804,8 @@ bp HEVD!TriggerStackOverflow
 
 ## Tier 5 — Patch Diffing (Labs 21–23)
 
+> **Background reading:** ch11 (patch diffing workflow).
+
 ### Lab 21 — Download and Diff a Patch Tuesday Advisory
 
 **Objective:** Pick a recent Windows LPE advisory from MSRC, extract the patched binary, and BinDiff it against the previous version.
@@ -821,6 +833,8 @@ bp HEVD!TriggerStackOverflow
 ---
 
 ## Tier 6 — Variant Hunting (Labs 24–27)
+
+> **Background reading:** ch12 (variant hunting methodology).
 
 ### Lab 24 — COM Server Enumeration with NtObjectManager
 
@@ -903,10 +917,22 @@ For every completed lab, record:
 
 ## References
 
-- [R-1] HEVD — HackSysTeam — https://github.com/hacksysteam/HackSysExtremeVulnerableDriver
-- [R-2] symboliclink-testing-tools — Forshaw/PZ — https://github.com/googleprojectzero/symboliclink-testing-tools
-- [R-3] sandbox-attacksurface-analysis-tools — Forshaw/PZ — https://github.com/googleprojectzero/sandbox-attacksurface-analysis-tools
-- [R-4] PrivescCheck — itm4n — https://github.com/itm4n/PrivescCheck
-- [R-5] PrintSpoofer — itm4n — https://github.com/itm4n/PrintSpoofer
-- [R-6] WinDbg docs — Microsoft — https://learn.microsoft.com/en-us/windows-hardware/drivers/debugger/
-- [R-7] MSRC Update Guide — Microsoft — https://msrc.microsoft.com/update-guide/
+[R-1] HEVD — Kernel exploitation learning platform — https://github.com/hacksysteam/HackSysExtremeVulnerableDriver
+
+[R-2] NtObjectManager — Lab tooling for object manager research — https://github.com/googleprojectzero/sandbox-attacksurface-analysis-tools
+
+[R-3] PrivescCheck — Privilege escalation enumeration — https://github.com/itm4n/PrivescCheck
+
+[R-4] System Informer — Token and handle inspection — https://systeminformer.sourceforge.io/
+
+[R-5] WinDbg Preview — https://apps.microsoft.com/detail/9pgjgd53tn86
+
+[R-6] Process Monitor (ProcMon) — Sysinternals — https://learn.microsoft.com/en-us/sysinternals/downloads/procmon
+
+[R-7] RpcView — RPC enumeration tool — https://github.com/silverf0x/RpcView
+
+[R-8] AccessChk — Sysinternals — https://learn.microsoft.com/en-us/sysinternals/downloads/accesschk
+
+[R-9] CVE-2024-49039 MSRC Advisory — https://msrc.microsoft.com/update-guide/vulnerability/CVE-2024-49039
+
+[R-10] CVE-2025-21204 MSRC Advisory — https://msrc.microsoft.com/update-guide/vulnerability/CVE-2025-21204

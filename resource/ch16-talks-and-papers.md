@@ -2,6 +2,8 @@
 
 > Conference talks and papers are where research methodology is made explicit. A blog post shows *what* was found. A conference talk, when it is a good one, shows *how* it was found and *why that method works*. This chapter covers the most important talks in the Windows security research canon — not by novelty of the CVE, but by the density of transferable methodology. A researcher who internalizes j00ru's Bochspwn methodology can design a tool that finds 30 bugs in a new subsystem. One who only knows "j00ru found 30 infoleaks in 2017" cannot.
 
+> **Navigation:** Talks here are the primary literature behind ch08 (bug classes), ch09 (primitives), ch10 (kernel). Cross-Talk Reading Order section links back to the vault chapters.
+
 ---
 
 ## How to Read a Conference Talk as a Researcher
@@ -893,29 +895,22 @@ This path connects the foundational kernel knowledge (ch01, ch03, ch10) through 
 
 ## References
 
-- [R-1] Bochspwn BH 2013 — j00ru — https://j00ru.vexillium.org/talks/blackhat-usa-bochspwn-identifying-0-days-via-memory-access-analysis/
-- [R-2] Bochspwn Reloaded BH 2017 — j00ru — https://j00ru.vexillium.org/talks/blackhat-usa-bochspwn-reloaded-detecting-kernel-memory-disclosure/
-- [R-3] Bochspwn Revolutions Infiltrate 2018 — j00ru — https://j00ru.vexillium.org/talks/infiltrate-bochspwn-revolutions/
-- [R-4] Forshaw DEF CON 25 Object Manager — James Forshaw
-- [R-5] Windows Exploitation Tricks (2018) — Forshaw / Project Zero — https://googleprojectzero.blogspot.com/2018/04/windows-exploitation-tricks-exploiting.html
-- [R-6] The Pool Is Dead — Shafir / Ionescu — https://windows-internals.com/
-- [R-7] One I/O Ring to Rule Them All — Yarden Shafir — https://windows-internals.com/one-io-ring-to-rule-them-all-a-new-attack-primitive-on-windows-11/
-- [R-8] Registry BlueHat IL 2023 — j00ru — https://j00ru.vexillium.org/talks/bluehat-exploring-the-windows-registry-as-a-powerful-lpe-attack-surface/
-- [R-9] Registry OffensiveCon 2024 — j00ru — https://j00ru.vexillium.org/talks/offensivecon-practical-exploitation-of-windows-registry-vulnerabilities/
-- [R-10] Registry REcon 2024 — j00ru — https://j00ru.vexillium.org/talks/recon-peeling-back-the-windows-registry-layers/
-- [R-11] Registry CONFidence 2024 — j00ru — https://j00ru.vexillium.org/talks/confidence-windows-registry-deja-vu-the-return-of-confused-deputies/
-- [R-12] j00ru talk archive — https://j00ru.vexillium.org/talks/
-- [R-13] Black Hat Archives — https://www.blackhat.com/html/archives.html
-- [R-14] DEF CON Media Archive — https://media.defcon.org/
-- [R-15] Project Zero Issue Tracker (Windows) — https://bugs.chromium.org/p/project-zero/issues/list?q=windows
-- [R-16] Kernel Pool Exploitation on Windows 7 — Tarjei Mandt — DEF CON 19 (2011)
-- [R-17] Phrack archives — http://phrack.org/
-- [R-18] FudModule Technical Report — AhnLab ASEC / ANSSI — February 2024
-- [R-19] The COM-Back: Revisiting COM Activation Security — James Forshaw / Project Zero — January 2025
-- [R-20] Administrator Protection Attack and Defense — OffensiveCon / Hardwear.io 2024
-- [R-21] Windows Kernel Pool Exploitation 2024 — DEF CON 32 / Black Hat USA 2024
-- [R-22] ALPC Race Conditions — Hexacon 2024; CVE-2024-30088, CVE-2025-21418
-- [R-23] Breaking Out of AppContainers in 2024 — BlueHat IL / OffensiveCon 2024; CVE-2024-49039
-- [R-24] WTF Snapshot Fuzzer 2024 — Axel Souchet — HITB Singapore 2024 — https://github.com/0vercl0k/wtf
-- [R-25] Pool Party Mitigations and What Came After — SafeBreach Labs / Black Hat USA 2024
-- [R-26] Hexacon 2024 proceedings — https://www.hexacon.fr/
+[R-1] j00ru — *Bochspwn: Identifying 0-Days via Memory Access Pattern Analysis* (Black Hat USA 2013) — https://j00ru.vexillium.org/papers/
+
+[R-2] James Forshaw — *Abusing the NT Object Manager Namespace* (SyScan 2015) — https://github.com/tyranid/SyScan2015-AbusedNTObjectManager
+
+[R-3] James Forshaw — *Windows Exploitation Tricks: Exploiting Arbitrary File Writes for LPE* (Google P0 blog, 2018) — https://googleprojectzero.blogspot.com/2018/04/windows-exploitation-tricks-exploiting.html
+
+[R-4] Yarden Shafir, Alex Ionescu — *The Pool is Dead, Long Live the Pool* (DEF CON 29, 2021) — https://windows-internals.com/pool-party-exploitation-series/
+
+[R-5] Yarden Shafir — *One I/O Ring to Rule Them All* (DEF CON 30, 2022) — https://windows-internals.com/one-i-o-ring-to-rule-them-all-a-new-attack-primitive-for-windows-11/
+
+[R-6] AhnLab ASEC — *FudModule: Stealthy Kernel Exploitation via Driver Vulnerability* (2024) — https://asec.ahnlab.com/en/
+
+[R-7] James Forshaw — *The COM-Back: Revisiting COM Activation Security* (Project Zero, Jan 2025) — https://googleprojectzero.blogspot.com/
+
+[R-8] SafeBreach Labs — *Pool Party Mitigations and What Came After* (Black Hat USA 2024) — https://www.safebreach.com/research/
+
+[R-9] DEF CON 32 (2024) talks archive — https://defcon.org/html/defcon-32/dc-32-speakers.html
+
+[R-10] Hexacon 2024 program — https://www.hexacon.fr/

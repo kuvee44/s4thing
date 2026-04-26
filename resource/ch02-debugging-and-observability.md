@@ -373,6 +373,8 @@ dx @$cursession.TTD.Modules                 ; all loaded modules during trace
    as interleaved reads/writes at timestamps that are close but from different thread IDs.
 7. **Navigate to each access:** `.SeekTo()` to inspect context.
 
+> **Applied:** ch13 §13.11 uses TTD to analyze CVE-2024-38193 race condition. ch17 §Lab 2 is the hands-on TTD lab.
+
 ---
 
 ### TTD 2024–2025 Updates
@@ -673,6 +675,8 @@ both detection engineering and evasion research:
 
 Understanding these mechanisms helps both attackers (evasion) and defenders (detection hardening).
 
+> **See also:** ch12 §12.6 (WTF fuzzer uses ETW coverage). ch09 §5.6 (ETW for detecting coercion primitives). ch17 §Lab 20 (WNF + ETW correlation).
+
 ---
 
 ### ETW 2024–2025 Updates
@@ -857,6 +861,8 @@ large contiguous regions of a specific protection in the target process. Correla
 
 This section walks through a realistic debugging workflow for an LPE (Local Privilege Escalation)
 primitive. The specific bug is generic — the workflow pattern is transferable.
+
+> **See also:** ch17 §Labs 1–3 for hands-on debugging workflows.
 
 ### Scenario: "A service crashes when we send a malformed IOCTL"
 

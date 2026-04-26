@@ -135,6 +135,8 @@ Researchers who claim EoP when the bug is actually an SFB will have their submis
 - New "Researcher Spotlight" posts: MSRC now publishes quarterly posts highlighting individual researchers by name (with their consent)
 - Recognition is now explicitly tied to report quality metrics, not only CVE count — high-quality reports with detailed root cause analysis receive higher point weighting
 
+> **See also:** ch12 §2 (attack surface enumeration — what to audit before submitting). ch13 §13.9 (lessons on how to frame root cause for MSRC).
+
 ---
 
 ## 3. Zero Day Initiative (ZDI) as an Alternative
@@ -480,6 +482,8 @@ CVSS:4.0/AV:L/AC:L/AT:N/PR:L/UI:N/VC:H/VI:H/VA:H/SC:H/SI:H/SA:H
 | NVD / ZDI (2024+) | Common | Increasingly used |
 
 **Practical recommendation:** Submit with CVSS 3.1 to MSRC (as required). Include CVSS 4.0 in your public writeup for completeness and to align with 2024+ NVD practice.
+
+> **Context:** ch08 §9 (master bug class mapping) helps predict CVSS score before submission.
 
 ---
 
@@ -916,17 +920,45 @@ The `appid.sys` driver exposed an IOCTL interface that did not properly validate
 
 ---
 
+## Quick Reference: Key Numbers and Timelines
+
+| Item | Value |
+|------|-------|
+| MSRC standard response SLA | 90 days |
+| MSRC emergency (in-wild) response | <7 days |
+| ZDI standard deadline | 120 days |
+| MSRC Critical payout (Hyper-V escape) | Up to $250,000 |
+| MSRC Important payout (kernel EoP) | $30,000–$100,000 |
+| MSRC payout for VTL/VBS escape | $50,000–$150,000 |
+| ZDI kernel UAF (weaponizable) | $200,000–$400,000 |
+| CVSS 3.1 → 4.0 transition | MSRC still uses 3.1; know both |
+| CVE publication lag (MSRC) | Patch day or up to 7 days after |
+| Acknowledgment in MSRC advisory | Opt-out; default is credited |
+| Duplicate grace window | None — first to submit wins |
+
+---
+
 ## References
 
-- [R-1] MSRC Submission Portal — Microsoft — https://msrc.microsoft.com/report/vulnerability
-- [R-2] Windows Security Servicing Criteria — Microsoft — https://learn.microsoft.com/en-us/windows/security/security-servicing-criteria
-- [R-3] MSRC Bug Bounty Programs — Microsoft — https://www.microsoft.com/en-us/msrc/bounty
-- [R-4] ZDI Submission — Trend Micro ZDI — https://www.zerodayinitiative.com/
-- [R-5] CVSS v3.1 Calculator — FIRST — https://www.first.org/cvss/calculator/3.1
-- [R-6] Project Zero Disclosure Policy — Google — https://googleprojectzero.blogspot.com/p/vulnerability-disclosure-policy.html
-- [R-7] MSRC Acknowledgments — Microsoft — https://msrc.microsoft.com/update-guide/acknowledgement
-- [R-8] MSRC Severity Classification — Microsoft — https://msrc.microsoft.com/blog/2022/05/microsoft-vulnerability-severity-classification/
-- [R-9] NVD CVE Search — NIST — https://nvd.nist.gov/vuln/search
+[R-1] MSRC Bounty Program — https://www.microsoft.com/en-us/msrc/bounty
+
+[R-2] Zero Day Initiative (ZDI) — https://www.zerodayinitiative.com/
+
+[R-3] MSRC Security Update Guide — https://msrc.microsoft.com/update-guide/
+
+[R-4] FIRST CVSS v3.1 Calculator — https://www.first.org/cvss/calculator/3.1
+
+[R-5] FIRST CVSS v4.0 Specification — https://www.first.org/cvss/v4.0/specification-document
+
+[R-6] Google Project Zero — 90-Day Disclosure Policy — https://googleprojectzero.blogspot.com/p/vulnerability-disclosure-faq.html
+
+[R-7] CISA Coordinated Vulnerability Disclosure — https://www.cisa.gov/coordinated-vulnerability-disclosure-process
+
+[R-8] CVE Numbering Authority (CNA) Guide — https://www.cve.org/ResourcesSupport/AllResources/CNARules
+
+[R-9] Microsoft Security Response Center blog — https://msrc.microsoft.com/blog/
+
+[R-10] ZDI Advisories — https://www.zerodayinitiative.com/advisories/published/
 - [R-10] SpecterOps ADCS Research (ESC1-ESC8) — Will Schroeder / Andy Robbins — https://posts.specterops.io/certified-pre-owned-d95910965cd2
 - [R-11] CVSS 4.0 Specification — FIRST — https://www.first.org/cvss/v4-0/
 - [R-12] CVSS 4.0 Calculator — FIRST — https://www.first.org/cvss/calculator/4.0

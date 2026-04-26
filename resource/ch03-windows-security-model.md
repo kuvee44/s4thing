@@ -8,6 +8,8 @@
 
 Every thread and process has an associated *access token*. The token is the identity credential used for all access checks on the machine.
 
+> **Exploitation:** ch08 §3 (Potato family abuses token impersonation). ch09 §5 (coercion as token impersonation primitive).
+
 ### Token Structure
 
 ```
@@ -390,6 +392,8 @@ SE_SACL_MANDATORY_LABEL_NO_EXECUTE_UP — processes below object's IL cannot exe
 **Default policy:** `NO_WRITE_UP` is the default for most objects. This means a Medium-IL process cannot write to a High-IL object even if the DACL would normally allow it.
 
 **Attack implication:** Most Windows LPE bugs involve crossing the Medium → High or Medium → System boundary. A bug that only allows Medium → Low is not a privilege escalation.
+
+> **Attack surface:** ch07 §4.4 (CVE-2024-49039 AppContainer→medium IL). ch08 §4 (RPC/COM boundary bugs exploit MIC).
 
 ### SeRelabelPrivilege
 
@@ -802,6 +806,8 @@ whoami /priv | findstr SeImpersonatePrivilege
 ## 9. Administrator Protection (Windows 11 24H2)
 
 Administrator Protection is the most significant change to the Windows security model in 2024. It is a preview feature in Windows 11 24H2 that fundamentally redesigns how administrative elevation works, addressing the core weaknesses in the traditional UAC model.
+
+> **Bypass research:** ch12 §12.8 (variant hunting for Admin Protection bypass). ch13 (no case study yet — first bypasses appeared 2025).
 
 ### The Problem Administrator Protection Solves
 

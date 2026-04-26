@@ -164,6 +164,8 @@ Using RpcView (GUI):
 or LocalService are the highest-priority targets. Every such interface is a potential LPE if
 it accepts user-influenced parameters.
 
+> **Enumeration:** ch15 §Cat1 (RpcView tool). ch17 §Lab 12 (named pipe enumeration exercise).
+
 ### 2.6 Notable RPC CVEs (2024)
 
 **CVE-2024-26229 — Windows CSC Service RPC LPE (CVSS 7.8, patched March 2024)**
@@ -669,6 +671,8 @@ Bypass path: NtAlpcConnectPort → \RPC Control\<pipe-name>
 
 ## 6. Authentication Coercion: Forcing Outbound Authentication
 
+> **Primitives:** ch09 §5 (Coercion Primitives — full reference). ch08 §4 (RPC/COM boundary bugs). ch07 §8 (FullPowers for token restoration after coercion).
+
 ### 6.1 The Pattern
 
 All authentication coercion bugs share one structural pattern:
@@ -1064,6 +1068,8 @@ if (-not $patch) { Write-Warning "CVE-2024-43532 patch may not be applied" }
 ---
 
 ## 9. Recent Developments (2024–2025)
+
+> **See also:** ch12 §12.8 (coercion variant hunting after NTLM EPA hardening).
 
 ### 9.1 CVE Summary Table
 

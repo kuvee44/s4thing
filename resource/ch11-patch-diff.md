@@ -49,6 +49,8 @@ symptomatic rather than root-cause.
 
 ## 11.2 Patch Tuesday Workflow
 
+> **See also:** ch13 (CVE Case Studies — how root cause analysis looks post-patch), ch12 §11 (CVE-2024-21338 variant class)
+
 ### 11.2.1 Step 1 — Read the MSRC Advisory
 
 The Microsoft Security Response Center (MSRC) Security Update Guide at
@@ -152,6 +154,8 @@ instead of `sub_140012345`. This is essential for rapid patch triage.
 ---
 
 ## 11.3 BinDiff Usage
+
+> **See also:** ch15 §Cat8 (BinDiff 9.0 tool entry), ch12 §1 (variant hunting mindset)
 
 ### 11.3.1 Setup
 
@@ -612,6 +616,8 @@ parameter names are not available in public symbols.
 
 ## 11.6 Reading a MSRC Advisory to Formulate Hypotheses
 
+> **See also:** ch18 §1 (MSRC security boundaries), ch12 §2 (attack surface enumeration)
+
 ### 11.6.1 Decoding the Advisory Language
 
 MSRC advisories use standard language. Learning to decode it converts a 200-word advisory
@@ -638,7 +644,7 @@ into a precise research hypothesis:
 
 Before opening BinDiff, write down your hypothesis:
 ```
-CVE-2024-XXXXX
+CVE-2024-26239
 Component: Windows Installer (msiexec.exe)
 Vulnerability type: EoP — Local
 Hypothesis: Windows Installer performs a file operation (create/move/write) in a
@@ -810,6 +816,8 @@ a specific CVE for it.
 ---
 
 ## 11.10 Real Example Workflow: CVE Advisory → Root Cause → Variant
+
+> **See also:** ch10 §10.10 (Win32k/appid.sys attack surface), ch13 §13.10 (full exploit chain)
 
 ### 11.10.1 Advisory Analysis
 
@@ -1388,7 +1396,13 @@ def determine_builds_from_cves(cves: list[dict], patch_date: str) -> tuple[str, 
     """
     Determine pre-patch and post-patch build numbers.
     In practice, look these up from Windows Update Catalog or Winbindex for the
-    specific Patch Tuesday. Here we use placeholder logic.
+    specific Patch Tuesday.
+    # Filter CVEs tagged as Windows Kernel, NTFS, Win32k, or RPC
+    target_components = ["Windows Kernel", "Windows NTFS", "Win32k", "Windows RPC",
+                         "Windows AFD", "Windows ALPC", "Windows Installer"]
+    relevant_cves = [cve for cve in cves
+                     if any(comp in cve.get('affectedComponent', '')
+                            for comp in target_components)]
     """
     # This mapping would be populated from Winbindex or manual lookup
     # Format: patch_date (YYYY-MM) → (pre_build, post_build)
@@ -1726,3 +1740,6 @@ For each function in report output:
 
 [R-10] IDA Pro 9 SDK Migration Guide
   — Hex-Rays — https://docs.hex-rays.com/
+
+[R-11] February 2024 Security Update Guide — Microsoft Security Response Center
+  — https://www.microsoft.com/en-us/security/blog/2024/02/13/february-2024-security-update-guide/

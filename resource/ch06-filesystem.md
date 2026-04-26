@@ -566,6 +566,8 @@ The delete-before-create TOCTOU window with hard links is commonly combined with
 
 ## 5. Opportunistic Locks (Oplocks): Mechanics and Exploitation
 
+> **Bug class:** ch08 §2 (Junction + Oplock TOCTOU). ch09 §1 (File System Primitives including oplock-based timing).
+
 ### 5.1 What is an Oplock?
 
 An **opportunistic lock** is a mechanism that allows a process to request notification from
@@ -860,6 +862,8 @@ vulnerable service action.
 
 ## 7. Arbitrary File Write → LPE Chain
 
+> **Bug class reference:** ch08 §1 (Arbitrary File Write as bug class). ch09 §1.3–1.5 (file move/rename/delete primitives).
+
 ### 7.1 The Canonical Chain (Forshaw's Methodology)
 
 An **arbitrary file write** primitive means: an attacker can cause a SYSTEM process to
@@ -998,6 +1002,8 @@ TxF is primarily relevant as an evasion technique in older environments (pre-202
 ---
 
 ## 9. Minifilter Architecture and EDR Bypass Surface
+
+> **See also:** ch02 §9.8 (Sealighter-TI + minifilter combined analysis). ch15 §Cat7 (detection tools).
 
 ### 9.1 The Filter Manager Model
 

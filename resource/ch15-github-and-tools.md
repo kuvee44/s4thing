@@ -2,6 +2,8 @@
 
 > A curated registry of repositories that are directly useful for Windows security research. Every entry here earns its place: either it is an indispensable tool, an educational lab environment, or a PoC that teaches a fundamental technique. Repositories are rated by trust level and annotated with what you actually use them for.
 
+> **Navigation:** Tools here are used in labs (ch17), discussed in researcher profiles (ch14), and referenced throughout techniques chapters (ch04–ch13).
+
 ---
 
 ## Trust Levels
@@ -1443,30 +1445,36 @@ pdb-downloader.exe C:\Diff\clfs_post.sys --output C:\Symbols\
 
 ## References
 
-- [R-1] sandbox-attacksurface-analysis-tools — James Forshaw / Google Project Zero — https://github.com/googleprojectzero/sandbox-attacksurface-analysis-tools
-- [R-2] symboliclink-testing-tools — James Forshaw / Google Project Zero — https://github.com/googleprojectzero/symboliclink-testing-tools
-- [R-3] PrivescCheck — itm4n — https://github.com/itm4n/PrivescCheck
-- [R-4] HEVD — HackSysTeam — https://github.com/hacksysteam/HackSysExtremeVulnerableDriver
-- [R-5] RpcView — silverf0x — https://github.com/silverf0x/RpcView
-- [R-6] msiscan — community — MSI static analysis tool
-- [R-7] impacket — Fortra — https://github.com/fortra/impacket
-- [R-8] WTF fuzzer — 0vercl0k — https://github.com/0vercl0k/wtf
-- [R-9] jackalope — Google Project Zero — https://github.com/googleprojectzero/jackalope
-- [R-10] Rubeus — GhostPack/SpecterOps — https://github.com/GhostPack/Rubeus
-- [R-11] BloodHound — SpecterOps — https://github.com/BloodHoundAD/BloodHound
-- [R-12] Certipy — Oliver Lyak — https://github.com/ly4k/Certipy
-- [R-13] Coercer — p0dalirius — https://github.com/p0dalirius/Coercer
-- [R-14] Volatility3 — Volatility Foundation — https://github.com/volatilityfoundation/volatility3
-- [R-15] KrbRelayUp — Dec0ne — https://github.com/Dec0ne/KrbRelayUp
-- [R-16] Whisker — Elad Shamir — https://github.com/eladshamir/Whisker
-- [R-17] Adalanche — Lars Karlslund — https://github.com/lkarlslund/Adalanche
-- [R-18] SafetyKatz — GhostPack — https://github.com/GhostPack/SafetyKatz
-- [R-19] ADExplorer — Microsoft/Sysinternals — https://learn.microsoft.com/en-us/sysinternals/downloads/adexplorer
-- [R-20] Sealighter-TI — pathtofile — https://github.com/pathtofile/SealighterTI
-- [R-21] SilkETW — Mandiant — https://github.com/mandiant/SilkETW
-- [R-22] KrabsETW — Microsoft — https://github.com/microsoft/krabsetw
-- [R-23] BinDiff — Google/Zynamics — https://github.com/google/bindiff
-- [R-24] Diaphora — Joxean Koret — https://github.com/joxeankoret/diaphora
-- [R-25] Winbindex — m417z — https://winbindex.m417z.com / https://github.com/m417z/winbindex
-- [R-26] SharpToken — community — token impersonation enumeration tool
-- [R-27] CVE-2024-21338 — AhnLab ASEC / ANSSI — published technical analysis of appid.sys IOCTL UAF
+[R-1] sandbox-attacksurface-analysis-tools — https://github.com/googleprojectzero/sandbox-attacksurface-analysis-tools
+
+[R-2] PrivescCheck — https://github.com/itm4n/PrivescCheck
+
+[R-3] HEVD — https://github.com/hacksysteam/HackSysExtremeVulnerableDriver
+
+[R-4] Sysinternals Suite — https://learn.microsoft.com/en-us/sysinternals/
+
+[R-5] System Informer (Process Hacker 3) — https://systeminformer.sourceforge.io/
+
+[R-6] impacket — https://github.com/fortra/impacket
+
+[R-7] Jackalope fuzzer — https://github.com/googleprojectzero/jackalope
+
+[R-8] WTF (What The Fuzz) — https://github.com/0vercl0k/wtf
+
+[R-9] RpcView — https://github.com/silverf0x/RpcView
+
+[R-10] BloodHound — https://github.com/BloodHoundAD/BloodHound
+
+[R-11] Certipy — https://github.com/ly4k/Certipy
+
+[R-12] Coercer — https://github.com/p0dalirius/Coercer
+
+[R-13] SharpToken — https://github.com/BeichenDream/SharpToken
+
+[R-14] Sealighter-TI — https://github.com/pathtofile/Sealighter
+
+[R-15] BinDiff — https://www.zynamics.com/bindiff.html
+
+[R-16] Diaphora — https://github.com/joxeankoret/diaphora
+
+[R-17] Winbindex — https://winbindex.m417z.com/

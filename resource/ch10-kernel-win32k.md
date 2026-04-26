@@ -10,6 +10,8 @@
 
 ## 10.1 Segment Heap Internals: The Post-20H1 Kernel Pool
 
+> **Foundation:** ch01 §5 covers kernel pool architecture. ch09 §3 covers heap-based kernel primitives.
+
 ### 10.1.1 NT Heap vs Segment Heap
 
 Before Windows 10 build 19041 (20H1, May 2020), the kernel pool used a classic
@@ -977,6 +979,8 @@ a specific machine, verify HVCI status before choosing exploitation strategy.
 
 ## 10.9 HEVD as Learning Lab
 
+> **Hands-on:** ch17 §Labs 16–20 are HEVD-based kernel exploitation exercises.
+
 ### 10.9.1 Setup
 
 HEVD (HackSys Extreme Vulnerable Driver) is the canonical kernel exploitation training
@@ -1375,6 +1379,8 @@ AppContainer escape in 24H2 is in `win32kbase` syscalls that remain allowed
 ---
 
 ## 10.11 In-the-Wild Kernel Exploits 2024–2025
+
+> **Full case study:** ch13 §13.10 (CVE-2024-21338) and §13.11 (CVE-2024-38193). **Variant hunting:** ch12 §11.
 
 ### 10.11.1 Overview Table
 

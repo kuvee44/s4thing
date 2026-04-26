@@ -5,6 +5,8 @@
 
 ## 1. Service Control Manager (SCM) Architecture
 
+> **See also:** ch08 §2 (Service binary weak ACL as bug class). ch17 §Lab 11 (hands-on weak service permissions lab).
+
 ### 1.1 What the SCM Is
 
 The Service Control Manager (`services.exe`) is the first non-kernel process launched by `wininit.exe` during boot. It is responsible for the complete lifecycle of all Windows services: creation, ordering, dependency resolution, startup, monitoring, and shutdown. The SCM exposes an RPC interface (`svcctl`) consumed by `sc.exe`, PowerShell `*-Service` cmdlets, and any application that calls the Win32 service APIs (`OpenSCManager`, `OpenService`, `ChangeServiceConfig`, etc.).
@@ -193,6 +195,8 @@ When a service binary (or a DLL it loads) calls `LoadLibrary("example.dll")` wit
 ---
 
 ## 3. Windows Installer (MSI) Architecture
+
+> **Tools:** ch15 §msiscan. **Bug class:** ch08 §6 (DLL hijacking in MSI custom actions).
 
 ### 3.1 MSI Service Internals
 
@@ -419,6 +423,8 @@ tracerpt C:\Temp\msi_trace.etl -o C:\Temp\msi_report.xml
 
 ## 4. Task Scheduler as LPE Vector
 
+> **Case study:** ch13 §13.12 (CVE-2024-49039 — RomCom APT Task Scheduler exploitation). ch17 §Lab 14 (AppContainer RPC lab).
+
 ### 4.1 Architecture and Attack Surface
 
 The Task Scheduler service (`Schedule.exe`) runs as LocalSystem and manages all scheduled tasks. It exposes:
@@ -635,6 +641,8 @@ BITS jobs persist across reboots and can transfer files to/from network shares o
 ---
 
 ## 6. Windows Error Reporting (WER) as File Write Primitive
+
+> **Primitive chain:** ch09 §1 uses WER arb file write as file primitive. ch08 §1.2.1 covers CVE-2024-30030.
 
 ### 6.1 WER Architecture
 

@@ -9,6 +9,8 @@
 > **Last updated:** 2025-04 — incorporates CVE-2024-21310, CVE-2024-26218, CVE-2025-21333/34/35,
 > shadow directory technique, PoolParty + handle table chains, NtCreateSymbolicLinkObject hardening bypass.
 
+> **Bug class:** ch08 §5 covers Object Manager Namespace Abuse as a bug class. ch09 §8 covers namespace primitives for exploitation.
+
 ---
 
 ## 1. Mental Model: Three Layers of the Windows Namespace
@@ -202,6 +204,8 @@ the object's name and a back-pointer to the `_OBJECT_DIRECTORY` that owns it.
 
 ## 3. Handle Tables
 
+> **See also:** ch09 §9 (Handle Table Spray primitive). ch10 §10.6 (handle table address as KASLR leak).
+
 ### 3.1 Structure and Organization
 
 Handles are integers representing open references to kernel objects within a process context. The
@@ -301,6 +305,8 @@ dt nt!_HANDLE_TABLE <EPROCESS.ObjectTable>
 
 Windows has six meaningfully distinct link types, each operating at a different layer of the
 name resolution stack. Understanding the differences is essential for designing attacks.
+
+> **Exploitation pattern:** ch06 §3 (reparse points + symlinks for TOCTOU). ch08 §2 (Junction + Oplock TOCTOU pattern).
 
 | Type | Privilege Required | Redirection Level | Creation API | Cross-Volume? |
 |---|---|---|---|---|
@@ -738,6 +744,174 @@ Get-NtDirectory -Path "\" | Get-NtDirectoryEntry | ForEach-Object {
 - Registry write: registry symlink redirect  
 - Named object lookup: object squatting
 - Shadow directory available: plant shadow objects for privileged lookup redirection
+
+---
+
+## 12. WinDbg Deep-Dive: Object Manager Internals
+
+The following commands expose the object manager's runtime state. Run these during exploit development to verify namespace manipulation, confirm object counts, and inspect handle table structure.
+
+### 12.1 Navigating the Object Namespace
+
+```windbg
+; List root namespace directories
+kd> !object \
+
+; Explore a specific directory
+kd> !object \Device
+kd> !object \BaseNamedObjects
+kd> !object \Sessions\1\BaseNamedObjects
+
+; Inspect a specific object
+kd> !object \Device\NamedPipe
+kd> dt nt!_OBJECT_DIRECTORY poi(nt!ObpRootDirectoryObject)
+
+; Find shadow directories (NtCreateDirectoryObjectEx)
+kd> !object \Sessions\0\DosDevices
+```
+
+### 12.2 Symbolic Link Inspection
+
+```windbg
+; Follow a symbolic link
+kd> !object \DosDevices\C:
+kd> dt nt!_OBJECT_SYMBOLIC_LINK <address>
+
+; Show link target
+kd> dt nt!_OBJECT_SYMBOLIC_LINK <addr> LinkTarget
+kd> du <LinkTarget.Buffer address>
+
+; Enumerate all symlinks in a directory
+kd> !object \GLOBAL??
+```
+
+### 12.3 Handle Table Analysis
+
+```windbg
+; Per-process handle table
+kd> !process 0 0 notepad.exe
+kd> dt nt!_EPROCESS <addr> ObjectTable
+kd> !handle 0 0 <process addr>
+
+; Handle table entry detail
+kd> dt nt!_HANDLE_TABLE_ENTRY
+kd> !handle <handle_value> 7 <process addr>
+
+; Find all processes with a handle to a specific object
+kd> !findhandle <object_addr>
+```
+
+### 12.4 Object Header and Reference Counts
+
+```windbg
+; Object header (precedes every object body)
+kd> dt nt!_OBJECT_HEADER
+kd> dt nt!_OBJECT_HEADER <object_addr - 0x30>
+
+; Reference count — watch for UAF (count drops to 0 unexpectedly)
+kd> dt nt!_OBJECT_HEADER <addr> PointerCount
+kd> dt nt!_OBJECT_HEADER <addr> HandleCount
+
+; Object type info
+kd> dt nt!_OBJECT_TYPE
+kd> dps nt!ObTypeIndexTable L50  ; list all object types by index
+```
+
+### 12.5 Monitoring Object Creation/Deletion
+
+```windbg
+; Break on object creation for a specific type
+kd> bp nt!ObCreateObjectEx "j (@rcx == poi(nt!MmSectionObjectType)) 'k;g'; 'g'"
+
+; Break on handle duplication
+kd> bp nt!ObDuplicateObject "k 5; g"
+
+; Monitor symbolic link creation (useful for catching TOCTOU window)
+kd> bp nt!NtCreateSymbolicLinkObject "k; g"
+
+; Oplock break notifications
+kd> bp nt!FsRtlOplockBreakH "k 5; g"
+```
+
+### 12.6 Security Descriptor on Objects
+
+```windbg
+; Read security descriptor of an object
+kd> dt nt!_SECURITY_DESCRIPTOR
+kd> !sd <security_descriptor_addr>
+
+; Object's security — via object header optional fields
+kd> dt nt!_OBJECT_HEADER_CREATOR_INFO
+kd> dt nt!_OBJECT_HEADER_NAME_INFO
+```
+
+---
+
+## 13. Attack Scenario Walkthroughs
+
+These walkthroughs tie the object manager internals to concrete attack patterns, connecting theory to the bug classes in ch08.
+
+### 13.1 Scenario: Oplock + Junction TOCTOU (BaitAndSwitch)
+
+**Target:** A privileged process (SYSTEM) writes to a path it controls via CreateFile → WriteFile.
+
+**Step-by-step object manager perspective:**
+
+1. Attacker creates `C:\Temp\target.log` and places an **oplock** on it using `DeviceIoControl(FSCTL_REQUEST_OPLOCK_WRITE)`.
+2. Privileged process opens `C:\Temp\target.log` → triggers oplock break notification to attacker.
+3. **Oplock break window:** The privileged process is suspended waiting for the attacker to acknowledge the break.
+4. Attacker deletes `C:\Temp\target.log`, replaces `C:\Temp\` with a **junction** pointing to `C:\Windows\System32\`.
+5. Attacker acknowledges the oplock break.
+6. Privileged process resumes → its still-open path now resolves through the junction → writes to `C:\Windows\System32\target.log`.
+7. Attacker renames `target.log` to a DLL loaded by a privileged service → code execution as SYSTEM.
+
+**Object manager role:** The junction (`IO_REPARSE_TAG_MOUNT_POINT`) is resolved during `NtOpenFile` path traversal. The key is that the privileged process's **existing handle** does not re-resolve — only new opens through the directory hit the junction. The race window is the oplock break acknowledgment gap.
+
+**WinDbg:** Set `bp nt!NtCreateFile` with path logging. Watch for the junction insertion in the oplock break window.
+
+> **See also:** ch06 §6 (BaitAndSwitch pattern detail), ch08 §2 (bug class), ch09 §2 (timing primitives).
+
+### 13.2 Scenario: Shadow Directory for Namespace Squatting
+
+**Target:** A service creates a named pipe at `\Device\NamedPipe\MyService` but doesn't pre-create it before the pipe server starts.
+
+**NtCreateDirectoryObjectEx** (Shadow directory technique — itm4n 2024):
+
+```c
+// Create a shadow directory that mirrors \Device\NamedPipe
+HANDLE hShadow;
+UNICODE_STRING name;
+RtlInitUnicodeString(&name, L"\\Device\\NamedPipe");
+OBJECT_ATTRIBUTES oa = {sizeof(oa), NULL, &name, 0, NULL, NULL};
+
+// NtCreateDirectoryObjectEx: shadowDirectory parameter
+NtCreateDirectoryObjectEx(&hShadow, DIRECTORY_ALL_ACCESS, &oa, 
+                           hParentDirectory, TRUE);
+// Now create the squatted pipe inside shadow directory
+// Service's pipe clients will connect to attacker's pipe
+```
+
+**Why it works:** The shadow directory overlays the real `\Device\NamedPipe` for new object creation requests from processes in the same session. Object manager resolves names in session-local directories first.
+
+> **See also:** ch05 §5.3 (Named Pipe Squatting attack), ch08 §5 (Object Manager Namespace Abuse bug class).
+
+### 13.3 Scenario: Handle Table Spray for Type Confusion
+
+**Goal:** Spray the handle table to predict the handle value of a specific object, enabling type confusion when a vulnerable driver accepts a handle without type-checking.
+
+```c
+// Spray: create many objects of target type
+for (int i = 0; i < 0x1000; i++) {
+    CreateEvent(NULL, FALSE, FALSE, NULL);  // fills handle table slots
+}
+
+// At known handle density, target handle = base + (spray_count * 4)
+// Submit predicted handle to vulnerable IOCTL
+DWORD predictedHandle = 0x4 + (0x1000 * 4);
+DeviceIoControl(hDriver, IOCTL_VULN, &predictedHandle, 4, NULL, 0, &returned, NULL);
+```
+
+> **See also:** ch09 §9 (Handle Table Spray primitive), ch10 §10.6 (handle table as KASLR leak).
 
 ---
 

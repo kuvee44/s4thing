@@ -15,6 +15,8 @@ This chapter catalogs the canonical bug classes in depth: definition, root cause
 
 ## 1. Arbitrary File Write / Move / Delete
 
+> **See also:** ch06 §7 (Arbitrary File Write → LPE Chain), ch09 §1 (File System Primitives)
+
 ### 1.1 Definition and What Makes It LPE-able
 
 An **arbitrary file write** is the ability to write attacker-controlled content to an attacker-chosen path, with the write executing in a privileged context (SYSTEM, LocalSystem, or a high-privilege service account). Alone, writing a file doesn't escalate privilege. What makes it LPE-able is the conversion step: getting a privileged process to *execute* the written content.
@@ -143,7 +145,16 @@ NtCreateFile(
 
 **Practical impact:** Services that were "fixed" to use `FILE_OPEN_REPARSE_POINT` but not `OBJ_DONT_REPARSE` remain vulnerable to intermediate directory junction substitution. Researchers recommended `AccessCheck` tooling specifically look for this half-mitigation pattern.
 
-### 1.7 How to Find Arbitrary File Write/Move/Delete Bugs
+### 1.7 WinDbg — Arbitrary File Write Analysis
+
+```windbg
+; Monitor file write targets during exploit
+kd> !object \Device\HarddiskVolume3
+kd> dt nt!_FILE_OBJECT poi(@rcx)
+kd> bp ntdll!NtCreateFile "du @r8; g"  ; log file paths
+```
+
+### 1.8 How to Find Arbitrary File Write/Move/Delete Bugs
 
 **Process Monitor methodology:**
 1. Filter: `Process Name = <privileged binary>`, `Operation = CreateFile OR WriteFile OR SetRenameInformationFile`, `Path starts with C:\` or target path
@@ -160,6 +171,8 @@ NtCreateFile(
 ---
 
 ## 2. Junction + Oplock TOCTOU
+
+> **See also:** ch06 §6 (BaitAndSwitch pattern), ch04 §4 (Object Manager namespace)
 
 ### 2.1 The TOCTOU Race Window
 
@@ -211,7 +224,16 @@ The attacker's challenge: the race window between check and use may be microseco
 
 **Tools:** `SetOpLock.exe` and `BaitAndSwitch.exe` from James Forshaw's `symboliclink-testing-tools` repository implement this pattern.
 
-### 2.3 Thread Race vs. Oplock-Assisted Race
+### 2.3 WinDbg — Oplock Inspection
+
+```windbg
+; Inspect oplock state on a file
+kd> dt nt!_OPLOCK
+kd> !fltkd.filter  ; list registered minifilters
+kd> bp nt!FsRtlOplockBreakH "k; g"  ; trace oplock breaks
+```
+
+### 2.4 Thread Race vs. Oplock-Assisted Race
 
 Without oplocks, TOCTOU exploitation requires winning a tight timing window. This is unreliable (race is probabilistic, not deterministic). Oplocks make it deterministic: the privileged process literally cannot proceed until the attacker says so.
 
@@ -220,6 +242,8 @@ For bugs where the target file is not under attacker control (can't set oplock o
 ---
 
 ## 3. Token Impersonation — The Potato Family
+
+> **See also:** ch05 §5 (Named pipe squatting), ch09 §6 (Named Pipe Primitives)
 
 ### 3.1 SeImpersonatePrivilege — The Prerequisite
 
@@ -363,7 +387,19 @@ Windows Server 2025 ships with several default-enabled protections that raise th
 
 **Operational use:** Particularly useful in scenarios where the attacker has code execution as NetworkService or a service account with `SeImpersonatePrivilege` and needs to identify the most stable SYSTEM token source among many candidate processes.
 
-### 3.9 The Potato Progression — Timeline and Evolution
+### 3.9 WinDbg — Token Impersonation Analysis
+
+```windbg
+; Enumerate impersonatable tokens
+kd> !token  ; current thread token
+kd> dt nt!_TOKEN @$thread->ClientSecurity.Token
+kd> dps nt!PspReferencePrimaryToken L1  ; primary token
+; Find SYSTEM token
+kd> !process 0 0 System
+kd> dt nt!_EPROCESS <addr> Token
+```
+
+### 3.10 The Potato Progression — Timeline and Evolution
 
 | Tool | Year | Mechanism | Windows Compatibility | Status |
 |------|:----:|:---|:---:|:---:|
@@ -424,6 +460,8 @@ The COM Elevation Moniker (`Elevation:Administrator!new:{CLSID}`) is a designed 
 
 ## 5. Object Manager Namespace Abuse
 
+> **See also:** ch04 (Object Manager — full chapter)
+
 ### 5.1 Directory DACL Weakness
 
 The Windows Object Manager namespace (`\`, `\Device`, `\??\`, `\RPC Control`, `\Sessions\N\BaseNamedObjects`) is the kernel's naming layer beneath all Win32 APIs. Every named kernel object (file, pipe, event, semaphore, registry key) is accessible through this namespace.
@@ -449,6 +487,8 @@ The Windows Object Manager namespace (`\`, `\Device`, `\??\`, `\RPC Control`, `\
 ---
 
 ## 6. DLL Hijacking / Search Order Abuse
+
+> **See also:** ch07 §3 (MSI DLL hijacking), ch15 (Tools: msiscan)
 
 ### 6.1 LoadLibrary Search Order Deep Dive
 
@@ -694,6 +734,8 @@ accesschk64.exe -kwsur "Users" HKLM\SYSTEM\CurrentControlSet\Services
 
 ## 8. Kernel Memory Corruption — Overview
 
+> **See also:** ch10 (Kernel/Win32k — full chapter), ch09 §3 (Kernel Primitives)
+
 *(Detailed treatment in Chapter 10; this section provides the taxonomy.)*
 
 ### 8.1 Pool Overflow
@@ -754,7 +796,19 @@ The vulnerability was actively exploited by North Korea's Lazarus Group (APT38) 
 
 **Post-patch research:** The specific reference counting path was patched; however, AFD.sys's socket object lifecycle management remains a research area due to the complexity of asynchronous socket operations and their interaction with kernel pool allocation.
 
-### 8.7 GDI Object Type Confusion — Win32k Continued Attack Surface (2024)
+### 8.7 WinDbg — Kernel Memory Analysis
+
+```windbg
+; Pool spray verification
+kd> !poolused 2  ; show paged pool by tag
+kd> !pool <address> 2  ; detail on specific chunk
+kd> dt nt!_POOL_HEADER <addr>
+; AFD.sys UAF analysis
+kd> !devobj \Device\Afd
+kd> bp afd!AfdPoll "k 5; g"
+```
+
+### 8.8 GDI Object Type Confusion — Win32k Continued Attack Surface (2024)
 
 Despite Win32k isolation (which prevents sandboxed processes from issuing Win32k syscalls) and decades of hardening, Win32k remains an active LPE attack surface for unsandboxed processes (service contexts, interactive user sessions outside sandboxes).
 
@@ -770,7 +824,7 @@ The GDI handle table (`GDI_HANDLE_TABLE`) maps GDI handles to kernel objects. Ty
 
 **Tooling:** `win32k_fuzz` (various researchers) targets NtGdi syscalls with handle type confusion payloads; available on GitHub.
 
-### 8.8 KASLR Bypass via NtQuerySystemInformation Leak — 2024 Variants
+### 8.9 KASLR Bypass via NtQuerySystemInformation Leak — 2024 Variants
 
 Kernel Address Space Layout Randomization (KASLR) randomizes the base address of the kernel and drivers on each boot. A KASLR bypass is required for any kernel exploit that needs to calculate absolute addresses (e.g., to overwrite specific kernel data structures or gadget ROP chains).
 
@@ -796,6 +850,8 @@ Kernel Address Space Layout Randomization (KASLR) randomizes the base address of
 ---
 
 ## 9. Master Bug Class → Technique → Primitive → CVE Mapping
+
+> **See also:** ch13 (CVE case studies matching each bug class). ch17 §Labs 9–15 (reproduction labs for each class).
 
 | Bug Class | Technique | Primitive | Key CVE(s) | Tool |
 |-----------|-----------|-----------|-----------|------|
@@ -857,6 +913,8 @@ Kernel Address Space Layout Randomization (KASLR) randomizes the base address of
 ---
 
 ## 11. Bug Class Taxonomy Update (2024-2025)
+
+> **See also:** ch12 §1 (Variant hunting mindset), ch13 (CVE case studies)
 
 The foundational bug classes (file primitive abuse, token impersonation, registry ACL, kernel memory corruption) remain active. However, 2024-2025 research has produced several new or significantly elevated categories that deserve independent classification.
 
@@ -961,30 +1019,30 @@ The FudModule rootkit, attributed to Lazarus Group, demonstrated DKOM-based secu
 
 ## References
 
-[R-1] Windows Exploitation Tricks: Exploiting Arbitrary File Writes for LPE — James Forshaw — https://googleprojectzero.blogspot.com/2018/04/windows-exploitation-tricks-exploiting.html
+[R-1] James Forshaw — *Abusing the NT Object Manager Namespace* (SyScan 2015) — https://github.com/tyranid/SyScan2015-AbusedNTObjectManager
 
-[R-2] symboliclink-testing-tools — James Forshaw / Google Project Zero — https://github.com/googleprojectzero/symboliclink-testing-tools
+[R-2] itm4n — *PrintSpoofer: Abusing Impersonation Privileges on Windows 10 and Server 2019* — https://itm4n.github.io/printspoofer-abusing-impersonate-privileges/
 
-[R-3] Rotten Potato — Privilege Escalation from Service Accounts to SYSTEM — foxglovesecurity — https://foxglovesecurity.com/2016/09/26/rotten-potato-privilege-escalation-from-service-accounts-to-system/
+[R-3] decoder / splinter_code — *RoguePotato: from LOCAL/NETWORK SERVICE to SYSTEM* — https://decoder.cloud/2020/05/11/no-more-juicypotato-old-story-welcome-roguepotato/
 
-[R-4] Juicy Potato — Andrea Pierini, Giuseppe Trotta — https://ohpe.it/juicy-potato/
+[R-4] James Forshaw — *Windows Exploitation Tricks: Exploiting Arbitrary File Writes for Local Elevation of Privilege* — https://googleprojectzero.blogspot.com/2018/04/windows-exploitation-tricks-exploiting.html
 
-[R-5] RoguePotato — No More JuicyPotato — Decoder.cloud — https://decoder.cloud/2020/05/11/no-more-juicypotato-old-story-welcome-roguepotato/
+[R-5] Antonio Cocomazzi (splinter_code) — *CoercedPotato: Local Privilege Escalation via DCOM/RPC Coercion* (2024) — https://github.com/antonio-morales/CoercedPotato
 
-[R-6] PrintSpoofer: Abusing Impersonation Privileges on Windows 10 and Server 2019 — itm4n — https://itm4n.github.io/printspoofer-abusing-impersonate-privileges/
+[R-6] Clément Labro (itm4n) — *Bypassing LSA Protection (PPL) via CVE-2024-26218* — https://itm4n.github.io/
 
-[R-7] Windows Registry Rpceptmapper Exploit — itm4n — https://itm4n.github.io/windows-registry-rpceptmapper-exploit/
+[R-7] James Forshaw — *NtObjectManager PowerShell Module: Enumerating Accessible Named Objects* — https://github.com/googleprojectzero/sandbox-attacksurface-analysis-tools
 
-[R-8] Local Potato (CVE-2023-21746) — Decoder.cloud — https://www.decoder.cloud/2023/02/15/local-potato/
+[R-8] HEVD — HackSys Extreme Vulnerable Driver — https://github.com/hacksysteam/HackSysExtremeVulnerableDriver
 
-[R-9] Pool Party: New Process Injection Techniques — SafeBreach Labs — https://www.safebreach.com/blog/pool-party-windows-process-injection-techniques/
+[R-9] SafeBreach Labs — *CVE-2024-38193: Windows AFD.sys UAF Analysis* — https://www.safebreach.com/blog/
 
-[R-10] CVE-2024-38193: AFD.sys UAF Exploited by Lazarus Group — ESET / Microsoft MSRC — https://msrc.microsoft.com/update-guide/vulnerability/CVE-2024-38193
+[R-10] Avast Threat Intelligence — *Lazarus and the FudModule Rootkit: CVE-2024-21338* — https://decoded.avast.io/janvojtesek/lazarus-and-the-fudmodule-rootkit-beyond-byovd-with-an-admin-to-kernel-zero-day
 
-[R-11] FudModule Rootkit: Beyond BYOVD with Admin-to-Kernel Zero-Day — ESET — https://www.welivesecurity.com/en/eset-research/fudmodule-rootkit-beyond-byovd-admin-to-kernel-zero-day/
+[R-11] Microsoft MSRC — *CVE-2024-30051 Windows DWM Core Library Elevation of Privilege* — https://msrc.microsoft.com/update-guide/vulnerability/CVE-2024-30051
 
-[R-12] NtObjectManager — James Forshaw — https://github.com/googleprojectzero/sandbox-attacksurface-analysis-tools
+[R-12] Bryan Alexander / Drovorub — *Pool Party: 8 Novel Process Injection Techniques* — https://www.safebreach.com/research/process-injection-using-windows-thread-pools/
 
-[R-13] PrivescCheck — itm4n — https://github.com/itm4n/PrivescCheck
+[R-13] UACME — Defeating Windows User Account Control — https://github.com/hfiref0x/UACME
 
-[R-14] Administrator Protection in Windows 11 — Microsoft Security Blog — https://techcommunity.microsoft.com/blog/microsoftsecurityblog/administrator-protection-in-windows-11/
+[R-14] PrivescCheck — Privilege Escalation Enumeration Script for Windows — https://github.com/itm4n/PrivescCheck
